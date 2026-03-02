@@ -90,3 +90,12 @@ All bot data writes to `PROJECT_ROOT/.telegram_bot/`:
 - `logs/{user_id}_{session_id}_{date}.log` — debug chat logs
 
 SDK conversation logs: `~/.claude/projects/{PROJECT_DIR_NAME}/*.jsonl`
+
+## Version Release Preference
+<!-- github-push-and-release: release -->
+This project uses full release mode: CHANGELOG + commit + git tag + GitHub release.
+To force a full release, use `/github-push-and-release release`.
+
+## Git Commit Language Preference
+<!-- github-push-and-release-commit-lang: en -->
+Git commit messages use English.
