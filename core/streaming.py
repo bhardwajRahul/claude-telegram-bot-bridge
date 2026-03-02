@@ -48,6 +48,15 @@ class StreamingMessageHandler:
         self._draft_seq += 1
         return f"{self.user_id}-{int(time.time() * 1000)}-{self._draft_seq}"
 
+    @staticmethod
+    def _extract_message_id(message: Any) -> Optional[int]:
+        message_id = getattr(message, "message_id", None)
+        return message_id if isinstance(message_id, int) else None
+
+    @staticmethod
+    def _is_not_modified_error(error: Exception) -> bool:
+        return "message is not modified" in str(error).lower()
+
     async def _send_draft_compat(self, text: str) -> tuple[Optional[Any], Optional[str]]:
         """
         Try Telegram draft API first, then gracefully fall back.
@@ -81,15 +90,23 @@ class StreamingMessageHandler:
         content = text or "..."
         try:
             message, draft_id = await self._send_draft_compat(content)
-            if message is None:
-                message = await self.bot.send_message(
+            message_id = self._extract_message_id(message) if message is not None else None
+            if message_id is None:
+                if message is not None:
+                    logger.warning(
+                        f"send_message_draft returned non-message type ({type(message).__name__}), fallback to send_message"
+                    )
+                sent_message = await self.bot.send_message(
                     chat_id=self.chat_id,
                     text=content,
                 )
+                message_id = self._extract_message_id(sent_message)
+                if message_id is None:
+                    raise RuntimeError("send_message did not return a message with valid message_id")
                 draft_id = None
 
             draft = DraftState(
-                message_id=message.message_id,
+                message_id=message_id,
                 text=text,
                 last_update_time=time.time(),
                 char_count_since_update=0,
@@ -119,6 +136,12 @@ class StreamingMessageHandler:
             logger.debug(f"Updated draft {draft.message_id} ({len(new_text)} chars)")
             return True
         except TelegramError as e:
+            if self._is_not_modified_error(e):
+                draft.text = new_text
+                draft.last_update_time = time.time()
+                draft.char_count_since_update = 0
+                logger.debug(f"Draft {draft.message_id} unchanged on update, treated as success")
+                return True
             logger.error(f"Failed to update draft {draft.message_id}: {e}")
             return False
 
@@ -138,6 +161,9 @@ class StreamingMessageHandler:
             logger.debug(f"Finalized draft {draft.message_id}")
             return True
         except TelegramError as e:
+            if self._is_not_modified_error(e):
+                logger.debug(f"Draft {draft.message_id} already up-to-date on finalize")
+                return True
             logger.error(f"Failed to finalize draft {draft.message_id}: {e}")
             return False
 
@@ -192,6 +218,7 @@ class StreamingMessageHandler:
             return False
 
         self.accumulated_text += new_text_chunk
+        logger.debug(f"Accumulated {len(self.accumulated_text)} chars (chunk: {len(new_text_chunk)} chars)")
 
         # Check for overflow
         if len(self.accumulated_text) >= 4000:
@@ -207,6 +234,8 @@ class StreamingMessageHandler:
         current_draft = self.drafts[-1]
         chars_since_update = len(self.accumulated_text) - len(current_draft.text)
         current_draft.char_count_since_update = chars_since_update
+
+        logger.debug(f"Checking update: {chars_since_update} chars since last update, min_chars={self.min_chars}")
 
         if self.should_update(current_draft, chars_since_update):
             await self.update_draft(current_draft, self.accumulated_text)
