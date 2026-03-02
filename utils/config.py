@@ -84,6 +84,16 @@ class Config(BaseSettings):
             return [v]
         return v
 
+    # Streaming configuration
+    draft_update_min_chars: int = Field(
+        default=150,
+        description="Minimum characters to accumulate before sending draft update"
+    )
+    draft_update_interval: float = Field(
+        default=1.0,
+        description="Minimum seconds between draft updates"
+    )
+
     # Logging
     log_level: str = Field("INFO", description="Logging level")
     log_format: str = Field(

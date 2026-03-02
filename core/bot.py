@@ -401,6 +401,10 @@ class TelegramBot:
             return
         user_id = update.effective_user.id
         log_debug(user_id, "command", "/new")
+
+        # Cancel any ongoing streaming
+        await self._cancel_user_streaming(user_id)
+
         session = await session_manager.get_session(user_id)
         session["session_id"] = None
         session["new_session"] = True
@@ -521,6 +525,10 @@ class TelegramBot:
             return
         user_id = update.effective_user.id
         log_debug(user_id, "command", "/stop")
+
+        # Cancel any ongoing streaming
+        await self._cancel_user_streaming(user_id)
+
         killed = await project_chat_handler.stop(user_id)
         cleared = self._clear_user_queue(user_id)
 
@@ -555,6 +563,14 @@ class TelegramBot:
                 )
             except Exception:
                 pass
+
+    async def _cancel_user_streaming(self, user_id: int) -> bool:
+        """Cancel streaming for a user"""
+        try:
+            return await project_chat_handler.cancel_user_streaming(user_id)
+        except Exception as e:
+            logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
+            return False
 
     def _get_user_queue_lock(self, user_id: int) -> asyncio.Lock:
         lock = self._user_queue_locks.get(user_id)
@@ -650,9 +666,10 @@ class TelegramBot:
                 model=session.get("model"),
                 permission_callback=self._permission_callback,
                 typing_callback=lambda: update.message.chat.send_action(action="typing"),
+                bot=self.application.bot,
             )
             await self._save_session_id(user_id, response)
-            await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options)
+            await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options, streamed=response.streamed)
 
         async def on_overflow():
             reply = "⏳ Processing previous messages, please wait or send /stop to terminate."
@@ -679,9 +696,10 @@ class TelegramBot:
                     model=session.get("model"),
                     permission_callback=self._permission_callback,
                     typing_callback=lambda: update.message.chat.send_action(action="typing"),
+                    bot=self.application.bot,
                 )
                 await self._save_session_id(user_id, response)
-                await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options)
+                await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options, streamed=response.streamed)
             except Exception as e:
                 logger.error(f"Skill execution failed: {e}", exc_info=True)
                 await update.message.reply_text(f"❌ Execution failed: {str(e)}")
@@ -812,9 +830,10 @@ class TelegramBot:
                     new_session=new_session,
                     permission_callback=self._permission_callback,
                     typing_callback=lambda: update.message.chat.send_action(action="typing"),
+                    bot=self.application.bot,
                 )
                 await self._save_session_id(user_id, response)
-                await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options)
+                await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options, streamed=response.streamed)
 
             except Exception as e:
                 logger.error(f"Error in project chat: {e}", exc_info=True)
@@ -939,13 +958,16 @@ class TelegramBot:
             chunks.append(remaining)
         return chunks
 
-    async def _reply_smart(self, message, content: str, parse_mode: str = "Markdown", force_options: bool = False):
+    async def _reply_smart(self, message, content: str, parse_mode: str = "Markdown", force_options: bool = False, streamed: bool = False):
         """Reply with text (splitting if needed), send referenced files, and add option buttons."""
-        for part in self._split_text(content):
-            try:
-                await message.reply_text(part, parse_mode=parse_mode)
-            except Exception:
-                await message.reply_text(part)
+        # Skip text sending if already streamed
+        if not streamed:
+            for part in self._split_text(content):
+                try:
+                    await message.reply_text(part, parse_mode=parse_mode)
+                except Exception:
+                    await message.reply_text(part)
+
         # Send files mentioned in the response
         resolved_paths = self._resolve_paths(content)
         in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
@@ -958,14 +980,18 @@ class TelegramBot:
             if kb:
                 await message.reply_text("Please select:", reply_markup=kb)
 
-    async def _send_smart(self, chat_id: int, content: str, user_id: Optional[int] = None, force_options: bool = False):
+    async def _send_smart(self, chat_id: int, content: str, user_id: Optional[int] = None, force_options: bool = False, streamed: bool = False):
         """Send text to chat_id (splitting if needed) with file and option detection."""
         bot = self.application.bot
-        for part in self._split_text(content):
-            try:
-                await bot.send_message(chat_id, part, parse_mode="Markdown")
-            except Exception:
-                await bot.send_message(chat_id, part)
+
+        # Skip text sending if already streamed
+        if not streamed:
+            for part in self._split_text(content):
+                try:
+                    await bot.send_message(chat_id, part, parse_mode="Markdown")
+                except Exception:
+                    await bot.send_message(chat_id, part)
+
         resolved_paths = self._resolve_paths(content)
         in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
         await self._send_file_paths(chat_id, in_root_paths)
@@ -1034,9 +1060,10 @@ class TelegramBot:
                         model=session.get("model"),
                         permission_callback=self._permission_callback,
                         typing_callback=lambda: self.application.bot.send_chat_action(chat_id, action="typing"),
+                        bot=self.application.bot,
                     )
                     await self._save_session_id(user_id, response)
-                    await self._send_smart(chat_id, response.content, user_id=user_id, force_options=response.has_options)
+                    await self._send_smart(chat_id, response.content, user_id=user_id, force_options=response.has_options, streamed=response.streamed)
                 except Exception as e:
                     logger.error(f"Option reply failed: {e}", exc_info=True)
                     await self.application.bot.send_message(chat_id, f"❌ Processing failed: {e}")

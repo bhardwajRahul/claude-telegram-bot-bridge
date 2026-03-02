@@ -11,7 +11,8 @@ Telegram bot that integrates with Claude Code SDK to run Claude Code sessions an
 - All code, comments, variable names, shell messages, and log strings must be in **English**
 - Bot preset strings (command responses, status messages, error prompts) should be kept **minimal and in English**
 - The LLM (Claude) handles language adaptation naturally based on the user's conversation language — no hardcoded i18n needed
-
+- Openspec's documentation is in **Chinese**
+- Communication in Claude Code is in **Chinese** as much as possible
 
 ```bash
 # Setup
@@ -50,6 +51,9 @@ core/project_chat.py ProjectChatHandler — per-user long-lived Claude SDK
     │                streams, message queueing, tool permission callbacks,
     │                response processing, session history browsing
     │
+core/streaming.py    StreamingMessageHandler — progressive draft message updates
+    │                for real-time AI response streaming
+    │
 session/             SessionManager/SessionStore — per-user state in JSON
     │                (PROJECT_ROOT/.telegram_bot/sessions.json)
     │
@@ -66,6 +70,8 @@ utils/chat_logger.py Per-session debug chat logging
 
 ### Important patterns
 
+- **Progressive streaming**: AI responses are streamed in real-time using Telegram draft messages. Text updates every 150 characters or 1 second. Long messages (>4000 chars) automatically split into multiple drafts.
+- **Streaming interruption**: `/stop` and `/new` commands immediately cancel ongoing streaming and delete draft messages. Other commands (`/model`, `/resume`, `/skills`) do not interrupt streaming.
 - `AskUserQuestion` tool is degraded: converted to plain text with numbered options rendered as Telegram inline keyboard buttons.
 - Responses with file paths matching media extensions are auto-sent as Telegram photos/documents.
 - Message queue per user: max 3 concurrent tasks with overflow rejection.
@@ -81,6 +87,8 @@ utils/chat_logger.py Per-session debug chat logging
 | `CLAUDE_PROCESS_TIMEOUT` | No | SDK timeout in seconds (default: 600) |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
+| `DRAFT_UPDATE_MIN_CHARS` | No | Min characters before draft update (default: 150) |
+| `DRAFT_UPDATE_INTERVAL` | No | Min seconds between draft updates (default: 1.0) |
 
 ## Runtime directories
 

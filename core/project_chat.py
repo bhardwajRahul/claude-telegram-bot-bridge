@@ -106,6 +106,7 @@ class ChatResponse:
     error: Optional[str] = None
     session_id: Optional[str] = None
     has_options: bool = False
+    streamed: bool = False  # Whether message was already sent via streaming
 
 
 @dataclass
@@ -121,6 +122,7 @@ class _PendingRequest:
     last_typing_at: float = 0.0
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
+    streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
 
 
 @dataclass
@@ -314,6 +316,12 @@ class ProjectChatHandler:
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             req.last_assistant_texts.append(block.text)
+                            # Update streaming draft if handler is available
+                            if req.streaming_handler:
+                                try:
+                                    await req.streaming_handler.update_if_needed(block.text)
+                                except Exception as e:
+                                    logger.error(f"Streaming update failed: {e}")
                             if os.environ.get("BOT_DEBUG"):
                                 print(f"\033[36m[Claude]\033[0m {block.text[:200]}")
                         elif isinstance(block, ToolUseBlock):
@@ -324,6 +332,14 @@ class ProjectChatHandler:
                 if isinstance(msg, ResultMessage):
                     state.last_session_id = msg.session_id or state.last_session_id
                     result_text = msg.result or "\n".join(req.last_assistant_texts)
+
+                    # Finalize streaming drafts
+                    if req.streaming_handler:
+                        try:
+                            await req.streaming_handler.finalize_all()
+                        except Exception as e:
+                            logger.error(f"Streaming finalization failed: {e}")
+
                     if req.synthetic_response:
                         content = self._clean_response(req.synthetic_response) or "(No response)"
                     else:
@@ -341,12 +357,14 @@ class ProjectChatHandler:
                             success=False,
                             error=content,
                             session_id=msg.session_id,
+                            streamed=bool(req.streaming_handler and req.streaming_handler.drafts),
                         )
                     else:
                         log_chat(req.user_id, msg.session_id or req.requested_session_id, "assistant", content, model=req.model)
                         response = ChatResponse(
                             content=content, success=True, session_id=msg.session_id,
                             has_options=req.synthetic_response is not None,
+                            streamed=bool(req.streaming_handler and req.streaming_handler.drafts),
                         )
 
                     if not req.future.done():
@@ -369,6 +387,12 @@ class ProjectChatHandler:
             pending_copy = list(state.pending)
             state.pending.clear()
             for req in pending_copy:
+                # Finalize streaming drafts on error
+                if req.streaming_handler:
+                    try:
+                        await req.streaming_handler.finalize_all()
+                    except Exception as finalize_err:
+                        logger.error(f"Streaming finalization on error failed: {finalize_err}")
                 err = str(e)
                 log_chat(req.user_id, req.requested_session_id, "error", err, success=False)
                 if not req.future.done():
@@ -388,6 +412,7 @@ class ProjectChatHandler:
         new_session: bool = False,
         permission_callback: Optional[PermissionCallback] = None,
         typing_callback: Optional[TypingCallback] = None,
+        bot: Optional[Any] = None,
     ) -> ChatResponse:
         del message_id
         logger.info(f"Processing message from user {user_id}: {user_message[:80]}...")
@@ -399,6 +424,13 @@ class ProjectChatHandler:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
+
+        # Create streaming handler if bot is provided
+        streaming_handler = None
+        if bot:
+            from telegram_bot.core.streaming import StreamingMessageHandler
+            streaming_handler = StreamingMessageHandler(bot, chat_id, user_id)
+
         request = _PendingRequest(
             user_id=user_id,
             chat_id=chat_id,
@@ -407,6 +439,7 @@ class ProjectChatHandler:
             permission_callback=permission_callback,
             typing_callback=typing_callback,
             future=future,
+            streaming_handler=streaming_handler,
         )
         state: Optional[_UserStreamState] = None
 
@@ -453,6 +486,23 @@ class ProjectChatHandler:
     async def stop(self, user_id: int) -> bool:
         """Stop active stream for a user and fail all pending requests."""
         return await self._disconnect_user_stream(user_id, cancel_message="🛑 Task has been terminated.")
+
+    async def cancel_user_streaming(self, user_id: int) -> bool:
+        """Cancel streaming for a user by calling cancel() on all pending streaming handlers."""
+        state = self._streams.get(user_id)
+        if not state or not state.pending:
+            return False
+
+        cancelled = False
+        for req in state.pending:
+            if req.streaming_handler:
+                try:
+                    await req.streaming_handler.cancel()
+                    cancelled = True
+                except Exception as e:
+                    logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
+
+        return cancelled
 
     def inflight_count(self, user_id: int) -> int:
         state = self._streams.get(user_id)
