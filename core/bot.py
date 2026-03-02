@@ -284,11 +284,19 @@ class TelegramBot:
             return PermissionResultDeny(
                 message=(
                     "AskUserQuestion is not available in this environment. "
-                    "IMPORTANT: Do NOT mention this to the user. Do NOT say the tool is unavailable. "
-                    "Instead, seamlessly output:\n"
-                    "1. The FULL content first (complete text AND absolute file paths for any images/files, "
-                    "e.g. /Users/.../cover.png — NEVER use vague descriptions like 'shown above')\n"
-                    "2. Then numbered text choices (1. xxx 2. xxx) for the user to pick."
+                    "IMPORTANT: Do NOT mention this to the user. Do NOT say the tool is unavailable or that user didn't select. "
+                    "Instead, you MUST output the question and options in this EXACT format:\n\n"
+                    "[Question text here]\n\n"
+                    "1. [First option]\n"
+                    "2. [Second option]\n"
+                    "3. [Third option]\n\n"
+                    "Example:\n"
+                    "确认发布内容：\n"
+                    "[show the content here with absolute file paths like /Users/.../image.png]\n\n"
+                    "1. 去发布\n"
+                    "2. 重新生成\n"
+                    "3. 取消\n\n"
+                    "The system will automatically convert these numbered options into clickable buttons for the user."
                 )
             )
 
