@@ -35,3 +35,4 @@ env/
 logs/
 /.env
 .doc_hash
+openspec
