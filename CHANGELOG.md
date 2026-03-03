@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-04
+
+### Added
+- `/setup` skill for conversational, multi-language installation via Claude Code
+- Support for installation in any language (English, Chinese, Japanese, Spanish, French, German, etc.)
+- Interactive installation wizard with 4-step process (system check, configuration, Python environment, completion)
+
+### Changed
+- Renamed `install.sh` to `setup.sh` for consistency with skill naming
+- Moved Python virtual environment creation and dependency installation from `start.sh` to `setup.sh`
+- `start.sh` now checks for completed installation and provides friendly error message if not installed
+- Installation flow now requires running `setup.sh` or `/setup` skill before `start.sh`
+- Improved installation prompts with better formatting and clearer instructions
+- Fixed color code rendering issues in installation scripts (added `-e` flag to all `echo` commands with color variables)
+
+### Fixed
+- Script references in README updated from `install.sh` to `setup.sh`
+- Command examples in documentation now reflect new installation flow
+
 ## [0.3.0] - 2026-03-03
 
 ### Added
