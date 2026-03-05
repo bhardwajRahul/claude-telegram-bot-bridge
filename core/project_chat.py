@@ -576,6 +576,35 @@ class ProjectChatHandler:
     def is_user_busy(self, user_id: int) -> bool:
         return self.inflight_count(user_id) > 0
 
+    def clear_user_stream(self, user_id: int) -> None:
+        """Clear active stream for a user to force new SDK connection."""
+        if user_id in self._streams:
+            state = self._streams[user_id]
+            # Cancel reader and typing tasks
+            if state.reader_task and not state.reader_task.done():
+                state.reader_task.cancel()
+            if state.typing_task and not state.typing_task.done():
+                state.typing_task.cancel()
+            # Close SDK client
+            try:
+                if state.client:
+                    asyncio.create_task(state.client.close())
+            except Exception as e:
+                logger.error(f"Error closing SDK client for user {user_id}: {e}")
+            # Remove from streams dict
+            del self._streams[user_id]
+            logger.info(f"Cleared stream for user {user_id}")
+
+    def clear_pending_permissions(self, user_id: int) -> None:
+        """Clear pending permission futures for a user."""
+        state = self._streams.get(user_id)
+        if state:
+            # Clear any pending permission requests
+            for req in list(state.pending):
+                if req.permission_future and not req.permission_future.done():
+                    req.permission_future.cancel()
+            logger.info(f"Cleared pending permissions for user {user_id}")
+
     def list_sessions(self, limit: int = 10) -> List[Tuple[str, str, float]]:
         """List recent conversations: [(session_id, first_user_msg, mtime)]"""
         conv_dir = CONVERSATIONS_DIR
@@ -675,6 +704,63 @@ class ProjectChatHandler:
             return all_messages[-limit:] if all_messages else []
         except Exception as e:
             logger.error(f"Error reading session messages: {e}")
+            return []
+
+    def get_conversation_history(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get conversation history with message index for revert operations.
+
+        Returns list of USER messages only with index, timestamp, role, and content preview.
+        Messages are returned in reverse chronological order (newest first).
+        """
+        filepath = CONVERSATIONS_DIR / f"{session_id}.jsonl"
+        if not filepath.exists():
+            return []
+
+        try:
+            all_messages = []
+            with open(filepath, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = d.get("type")
+                    if msg_type != "user":
+                        continue
+
+                    msg = d.get("message", {})
+                    role = msg.get("role")
+                    if role != "user":
+                        continue
+
+                    content = msg.get("content", "")
+                    text = ""
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = block.get("text", "").strip()
+                                if text:
+                                    break
+                    elif isinstance(content, str):
+                        text = content.strip()
+
+                    if not text:
+                        continue
+
+                    timestamp = d.get("timestamp", "")
+                    all_messages.append({
+                        "index": idx,
+                        "role": role,
+                        "content": text,
+                        "timestamp": timestamp
+                    })
+
+            # Return newest first (reverse order)
+            recent_messages = all_messages[-limit:] if all_messages else []
+            return list(reversed(recent_messages))
+        except Exception as e:
+            logger.error(f"Error reading conversation history: {e}")
             return []
 
     @staticmethod

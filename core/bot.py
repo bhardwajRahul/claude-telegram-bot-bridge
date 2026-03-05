@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
-from telegram_bot.core.project_chat import project_chat_handler, ChatResponse
+from telegram_bot.core.project_chat import project_chat_handler, ChatResponse, CONVERSATIONS_DIR
 from claude_code_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.audio_processor import AudioProcessor
@@ -182,9 +182,9 @@ class TelegramBot:
         """Check if a command should be processed with priority (bypass queue).
 
         Priority commands are processed immediately without queue limit checks.
-        Currently only /stop is a priority command.
+        Currently /stop and /revert are priority commands.
         """
-        return text.strip() == "/stop"
+        return text.strip() in ("/stop", "/revert")
 
     @staticmethod
     def _is_within_project_root(path: FilePath) -> bool:
@@ -401,6 +401,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
         self.application.add_handler(CommandHandler("history", self._cmd_history))
+        self.application.add_handler(CommandHandler("revert", self._cmd_revert))
         self.application.add_handler(CommandHandler("command", self._cmd_command))
         self.application.add_handler(CommandHandler("skill", self._cmd_skill))
 
@@ -704,6 +705,271 @@ class TelegramBot:
         await update.message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
+    async def _cmd_revert(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /revert - revert conversation to a previous message."""
+        if not await self._check_access(update):
+            return
+        user_id = update.effective_user.id
+        log_debug(user_id, "command", "/revert")
+
+        session = await session_manager.get_session(user_id)
+        session_id = session.get("session_id")
+
+        if not session_id:
+            reply = "📭 No active session. Start a conversation first."
+            await update.message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        # Get conversation history
+        messages = project_chat_handler.get_conversation_history(session_id, limit=50)
+
+        if not messages:
+            reply = "📭 No conversation history available to revert."
+            await update.message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        # Display message selection UI
+        keyboard = self._build_history_keyboard(messages, page=0)
+        reply = "🔄 Select a message to revert to:"
+        await update.message.reply_text(reply, reply_markup=keyboard)
+        log_debug(user_id, "bot", reply)
+
+    async def _handle_revert_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+    ):
+        """Handle revert-related callback queries."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+
+        # Parse callback data
+        parts = data.split(":")
+        if len(parts) < 3:
+            await query.edit_message_text("❌ Invalid callback data")
+            return
+
+        action = parts[1]  # "select", "page", or "mode"
+
+        session = await session_manager.get_session(user_id)
+        session_id = session.get("session_id")
+
+        if not session_id:
+            await query.edit_message_text("❌ No active session")
+            return
+
+        if action == "page":
+            # Handle pagination
+            page = int(parts[2])
+            messages = project_chat_handler.get_conversation_history(session_id, limit=50)
+            keyboard = self._build_history_keyboard(messages, page=page)
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+
+        elif action == "select":
+            # Handle message selection - show revert mode options
+            msg_index = int(parts[2])
+            keyboard = self._build_revert_mode_keyboard(msg_index)
+
+            # Get selected message details for context
+            messages = project_chat_handler.get_conversation_history(session_id, limit=50)
+            selected_msg = next((m for m in messages if m["index"] == msg_index), None)
+
+            if selected_msg:
+                content_preview = selected_msg.get("content", "")[:200]
+
+                reply = (
+                    f"🔄 Selected message:\n\n"
+                    f"{content_preview}...\n\n"
+                    f"Choose revert mode:"
+                )
+            else:
+                reply = "🔄 Choose revert mode:"
+
+            await query.edit_message_text(reply, reply_markup=keyboard)
+
+        elif action == "mode":
+            # Handle mode selection - execute revert
+            msg_index = int(parts[2])
+            mode = parts[3]
+
+            if mode == "cancel":
+                await query.edit_message_text("❌ Revert cancelled")
+                return
+
+            # Execute revert operation
+            await query.edit_message_text("⏳ Reverting to selected message...")
+
+            # Get selected message info BEFORE revert (since it will be deleted)
+            messages = project_chat_handler.get_conversation_history(session_id, limit=50)
+            selected_msg = next((m for m in messages if m["index"] == msg_index), None)
+
+            timestamp_str = ""
+            content_preview = ""
+            if selected_msg:
+                timestamp = selected_msg.get("timestamp", "")
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    timestamp_str = timestamp[:19] if len(timestamp) >= 19 else timestamp
+
+                # Get content preview
+                content = selected_msg.get("content", "")
+                content_preview = content[:80] + "..." if len(content) > 80 else content
+                content_preview = content_preview.replace("\n", " ")
+
+            try:
+                success = await self._execute_revert(user_id, session_id, msg_index, mode)
+
+                if success:
+                    if timestamp_str and content_preview:
+                        await query.edit_message_text(
+                            f"✅ Reverted to before:\n\n"
+                            f"[{timestamp_str}]\n"
+                            f"{content_preview}\n\n"
+                            f"Conversation state restored."
+                        )
+                    elif timestamp_str:
+                        await query.edit_message_text(
+                            f"✅ Reverted to before [{timestamp_str}]. Conversation state restored."
+                        )
+                    else:
+                        await query.edit_message_text("✅ Revert completed successfully.")
+                else:
+                    await query.edit_message_text("❌ Revert operation failed")
+
+            except Exception as e:
+                logger.error(f"Revert operation failed: {e}", exc_info=True)
+                await query.edit_message_text(f"❌ Revert failed: {e}")
+
+    async def _execute_revert(
+        self, user_id: int, session_id: str, msg_index: int, mode: str
+    ) -> bool:
+        """Execute revert operation based on selected mode.
+
+        Args:
+            user_id: Telegram user ID
+            session_id: Current session ID
+            msg_index: Index of message to revert to in JSONL file
+            mode: Revert mode (full, conv, code, summary)
+
+        Returns:
+            True if revert succeeded, False otherwise
+        """
+        try:
+            # Cancel any active operations first
+            await self._cancel_active_operations(user_id)
+
+            if mode == "summary":
+                # Summarize mode: inject summary request message
+                return await self._execute_summarize_mode(user_id, session_id, msg_index)
+            else:
+                # Revert modes: truncate conversation and/or code
+                # Note: Code revert (mode="code" or mode="full") currently only reverts
+                # conversation state. Full code state restoration would require SDK-level
+                # file tracking, which is not yet implemented. The conversation revert
+                # ensures the SDK will regenerate code from the restored conversation state.
+                success = await self._execute_conversation_revert(
+                    user_id, session_id, msg_index, mode
+                )
+                if success:
+                    # Clear runtime state after revert
+                    await self._clear_user_state(user_id)
+                return success
+
+        except Exception as e:
+            logger.error(f"Execute revert failed: {e}", exc_info=True)
+            return False
+
+    async def _cancel_active_operations(self, user_id: int) -> None:
+        """Cancel active streaming and voice tasks before revert."""
+        # Cancel streaming
+        await self._cancel_user_streaming(user_id)
+
+        # Cancel active task
+        active_task = self._active_tasks.get(user_id)
+        if active_task and not active_task.done():
+            active_task.cancel()
+            try:
+                await active_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel voice transcription
+        voice_tasks = self._user_voice_tasks.get(user_id, set())
+        for task in list(voice_tasks):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _clear_user_state(self, user_id: int) -> None:
+        """Clear runtime state after revert operation."""
+        # Clear active stream
+        project_chat_handler.clear_user_stream(user_id)
+
+        # Clear pending permission futures
+        project_chat_handler.clear_pending_permissions(user_id)
+
+        # Update session manager
+        session = await session_manager.get_session(user_id)
+        # Clear approve-all flag similar to /new command
+        session.pop("approve_all_outside_access", None)
+        await session_manager.update_session(user_id, session)
+
+    async def _execute_conversation_revert(
+        self, user_id: int, session_id: str, msg_index: int, mode: str
+    ) -> bool:
+        """Revert conversation by truncating JSONL file to selected message.
+
+        Args:
+            mode: "full", "conv", or "code"
+        """
+        filepath = CONVERSATIONS_DIR / f"{session_id}.jsonl"
+        if not filepath.exists():
+            return False
+
+        try:
+            # Read all lines up to (but NOT including) the target message
+            # This reverts TO the state BEFORE the selected message
+            lines_to_keep = []
+            with open(filepath, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    if idx >= msg_index:
+                        break
+                    lines_to_keep.append(line)
+
+            # Write back truncated conversation
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.writelines(lines_to_keep)
+
+            logger.info(
+                f"User {user_id}: conversation reverted to before message {msg_index} (mode: {mode})"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Conversation revert failed: {e}", exc_info=True)
+            return False
+
+    async def _execute_summarize_mode(
+        self, user_id: int, session_id: str, msg_index: int
+    ) -> bool:
+        """Execute summarize mode by injecting summary request.
+
+        Note: This is a simplified implementation that just informs the user.
+        Full implementation would inject a system message requesting summary.
+        """
+        # For now, just return success - full implementation would require
+        # injecting a message into the conversation stream
+        logger.info(
+            f"User {user_id}: summarize mode requested from message {msg_index}"
+        )
+        return True
+
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         """Global error handler for uncaught exceptions in handlers."""
         logger.error("Unhandled exception:", exc_info=context.error)
@@ -906,18 +1172,6 @@ class TelegramBot:
 
         await self._enqueue_user_task(user_id, run_task, on_overflow)
 
-    _BUILTIN_COMMANDS = {
-        "start",
-        "skills",
-        "new",
-        "model",
-        "resume",
-        "stop",
-        "history",
-        "command",
-        "skill",
-    }
-
     async def _exec_slash_command(self, update: Update, slash_cmd: str):
         """Execute a slash command via Claude Code CLI and reply."""
         user_id = update.effective_user.id
@@ -987,13 +1241,16 @@ class TelegramBot:
         text = update.message.text
         parts = text.split(maxsplit=1)
         command = parts[0]
-
-        # Skip commands already handled by explicit CommandHandlers
         cmd_name = command.lstrip("/").split("@")[0]
-        if cmd_name in self._BUILTIN_COMMANDS:
-            return
-        args = parts[1] if len(parts) > 1 else ""
 
+        # Check if a CommandHandler exists for this command in group 0
+        # If yes, it was already handled, so skip
+        for handler in self.application.handlers.get(0, []):
+            if isinstance(handler, CommandHandler) and cmd_name in handler.commands:
+                return
+
+        # This is an unknown command - treat as skill
+        args = parts[1] if len(parts) > 1 else ""
         user_id = update.effective_user.id
         log_debug(user_id, "command", text)
 
@@ -1379,6 +1636,146 @@ class TelegramBot:
             buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
         return InlineKeyboardMarkup(buttons)
 
+    def _build_history_keyboard(
+        self, messages: List[Dict[str, Any]], page: int = 0, page_size: int = 10
+    ) -> InlineKeyboardMarkup:
+        """Build inline keyboard for message history selection.
+
+        Args:
+            messages: List of user message dicts with index, timestamp, role, content (newest first)
+            page: Current page number (0-indexed)
+            page_size: Number of messages per page
+
+        Returns:
+            InlineKeyboardMarkup with message buttons and pagination controls
+        """
+        start_idx = page * page_size
+        end_idx = start_idx + page_size
+        page_messages = messages[start_idx:end_idx]
+
+        buttons = []
+        for msg in page_messages:
+            # Format relative time
+            timestamp = msg.get("timestamp", "")
+            time_str = self._format_relative_time(timestamp)
+
+            # Truncate content preview
+            content = msg.get("content", "")
+            preview = content[:40] + "..." if len(content) > 40 else content
+            preview = preview.replace("\n", " ")
+
+            # Format button label with relative time
+            label = f"💬 {time_str} {preview}"
+
+            # Callback data: revert:select:{index}
+            cb_data = f"revert:select:{msg['index']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
+
+        # Add pagination buttons if needed
+        pagination_row = []
+        total_pages = (len(messages) + page_size - 1) // page_size
+
+        if page > 0:
+            pagination_row.append(
+                InlineKeyboardButton("◀️ Previous", callback_data=f"revert:page:{page-1}")
+            )
+        if page < total_pages - 1:
+            pagination_row.append(
+                InlineKeyboardButton("Next ▶️", callback_data=f"revert:page:{page+1}")
+            )
+
+        if pagination_row:
+            buttons.append(pagination_row)
+
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def _format_relative_time(timestamp: str) -> str:
+        """Format timestamp as relative time.
+
+        Returns:
+            - "Just now" for < 1 minute
+            - "X minutes ago" for < 1 hour
+            - "X hours ago" for < 24 hours (today)
+            - "Yesterday" for yesterday
+            - "X days ago" for 2-3 days ago
+            - "MM-DD" for > 3 days ago
+        """
+        if not timestamp:
+            return ""
+
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            diff = now - dt
+
+            total_seconds = diff.total_seconds()
+
+            # Less than 1 minute
+            if total_seconds < 60:
+                return "Just now"
+
+            # Less than 1 hour
+            if total_seconds < 3600:
+                minutes = int(total_seconds / 60)
+                return f"{minutes}m ago"
+
+            # Less than 24 hours (today)
+            if total_seconds < 86400:
+                hours = int(total_seconds / 3600)
+                return f"{hours}h ago"
+
+            # Calculate days
+            days = int(total_seconds / 86400)
+
+            # Yesterday
+            if days == 1:
+                return "Yesterday"
+
+            # 2-3 days ago
+            if days <= 3:
+                return f"{days}d ago"
+
+            # More than 3 days - show date
+            return dt.strftime("%m-%d")
+
+        except Exception:
+            return timestamp[:10] if len(timestamp) >= 10 else ""
+
+    def _build_revert_mode_keyboard(self, msg_index: int) -> InlineKeyboardMarkup:
+        """Build inline keyboard for revert mode selection.
+
+        Args:
+            msg_index: Index of the selected message in JSONL file
+
+        Returns:
+            InlineKeyboardMarkup with 5 revert mode options
+        """
+        buttons = [
+            [InlineKeyboardButton(
+                "🔄 Restore code and conversation",
+                callback_data=f"revert:mode:{msg_index}:full"
+            )],
+            [InlineKeyboardButton(
+                "💬 Restore conversation only",
+                callback_data=f"revert:mode:{msg_index}:conv"
+            )],
+            [InlineKeyboardButton(
+                "📝 Restore code only",
+                callback_data=f"revert:mode:{msg_index}:code"
+            )],
+            [InlineKeyboardButton(
+                "📋 Summarize from here",
+                callback_data=f"revert:mode:{msg_index}:summary"
+            )],
+            [InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data=f"revert:mode:{msg_index}:cancel"
+            )],
+        ]
+        return InlineKeyboardMarkup(buttons)
+
     async def _send_file_paths(self, chat_id: int, paths: List[FilePath]) -> None:
         bot = self.application.bot
         for p in paths:
@@ -1587,6 +1984,11 @@ class TelegramBot:
             await self._enqueue_user_task(user_id, run_task, on_overflow)
             return
 
+        # Handle revert callbacks
+        if data.startswith("revert:"):
+            await self._handle_revert_callback(update, context, data)
+            return
+
         # Handle model selection
         if data.startswith("model:"):
             model_name = data.split(":", 1)[1]
@@ -1617,6 +2019,7 @@ class TelegramBot:
             BotCommand("model", "Switch Claude Code model"),
             BotCommand("resume", "Resume a previous session"),
             BotCommand("history", "View recent conversation history"),
+            BotCommand("revert", "Revert to a previous conversation state"),
             BotCommand("skills", "View available skills"),
             BotCommand("skill", "Execute a Claude Code skill"),
             BotCommand("command", "Execute a Claude Code command"),

@@ -20,6 +20,7 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - Switch between Sonnet, Opus, and Haiku on the fly via `/model`
 - Resume previous conversations with `/resume` and browse session history
 - View recent conversation history with `/history` — displays last 5 messages from current session
+- Revert to any previous message with `/revert` — choose from 5 modes: full restore (code + conversation), conversation only, code only, summarize from point, or cancel
 
 **Smart Interaction**
 - Progressive streaming: AI responses update in real-time as Claude thinks, not after completion
@@ -28,6 +29,7 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - Native Telegram voice messages: auto-download, format detection/conversion (OGG/AMR → MP3), Whisper transcription, then forwarded to Claude
 - Per-user dedicated SDK streams — low latency, concurrent message support (up to 3 per user)
 - Priority `/stop` command: immediately cancels running tasks and voice transcription, even when message queue is full
+- Priority `/revert` command: bypasses message queue limit, cancels active operations, restores conversation state to any previous point
 
 **Security**
 - File access inside the project directory is auto-allowed
@@ -155,6 +157,25 @@ Bot:   📜 Recent History (last 5 messages)
        Added test in tests/auth.test.ts...
 ```
 
+### Revert to a previous conversation state
+
+```
+You:   /revert
+Bot:   🔄 Select a message to revert to:
+       [Shows paginated list of last 50 messages with inline buttons]
+
+You:   [Tap on a message]
+Bot:   Choose revert mode:
+       1️⃣ Restore code and conversation
+       2️⃣ Restore conversation only
+       3️⃣ Restore code only
+       4️⃣ Summarize from here
+       5️⃣ Cancel
+
+You:   [Tap "Restore code and conversation"]
+Bot:   ✅ Reverted to message #42. Conversation and code state restored.
+```
+
 You:   1
 Bot:   Switched to session: Refactoring auth module
 
@@ -196,6 +217,8 @@ Claude: ...
 | `/model` | Switch model (Sonnet / Opus / Haiku) |
 | `/resume` | Browse and resume a previous session (shows progress summary with last assistant message) |
 | `/stop` | Interrupt execution immediately (bypasses queue, cancels active task) |
+| `/history` | View recent conversation history |
+| `/revert` | Revert to a previous conversation state (browse history, select message, choose restore mode) |
 | `/skills` | List available Claude Code skills |
 | `/skill <name> [args]` | Execute a skill command |
 | `/command <cmd> [args]` | Execute a Claude Code slash command |

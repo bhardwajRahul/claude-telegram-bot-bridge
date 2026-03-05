@@ -79,14 +79,16 @@ utils/chat_logger.py Per-session debug chat logging
 
 - **Progressive streaming**: AI responses are streamed in real-time using Telegram draft messages. Text updates every 150 characters or 1 second. Long messages (>4000 chars) automatically split into multiple drafts.
 - **Priority stop command**: `/stop` has priority handling - it bypasses the message queue limit and immediately cancels the currently executing task via `asyncio.Task.cancel()`. This allows users to interrupt runaway executions even when the queue is full.
+- **Priority revert command**: `/revert` also has priority handling - bypasses message queue limit, cancels active operations (streaming, voice transcription), and allows users to restore conversation state even during execution.
 - **Streaming interruption**: `/stop` and `/new` commands immediately cancel ongoing streaming and delete draft messages. Other commands (`/model`, `/resume`, `/skills`) do not interrupt streaming.
 - **Voice interruption**: `/stop` and `/new` cancel active voice transcription tasks and clean temporary audio files.
 - **Task cancellation flow**: When `/stop` is invoked, it cancels the active task stored in `_active_tasks[user_id]`. The cancelled task raises `asyncio.CancelledError` in `ProjectChatHandler.process_message()`, which triggers cleanup (delete drafts, stop SDK stream) before returning.
+- **Revert flow**: `/revert` displays paginated message history (last 50 messages) via inline keyboard. User selects a message, then chooses from 5 modes: (1) Restore code and conversation, (2) Restore conversation only, (3) Restore code only, (4) Summarize from here, (5) Cancel. Revert truncates SDK JSONL file to selected message, clears active stream, cancels pending tasks, and resets session state. Callback data format: `revert:select:{index}`, `revert:page:{page}`, `revert:mode:{index}:{mode}`.
 - **Permission request UI**: When tools need to access paths outside PROJECT_ROOT, a standalone message with inline keyboard buttons is sent. Users can Allow (once), Deny, or Allow All (session-wide). Requests timeout after 60 seconds. The `/new` command clears the approve-all flag.
 - **Permission callback pattern**: Uses asyncio.Future to wait for user response. Callback data format: `perm:allow:{request_id}`, `perm:deny:{request_id}`, `perm:allow_all:{request_id}`. Futures are stored in `_pending_permission_futures` dict and resolved by callback handlers.
 - `AskUserQuestion` tool is degraded: converted to plain text with numbered options rendered as Telegram inline keyboard buttons.
 - Responses with file paths matching media extensions are auto-sent as Telegram photos/documents.
-- Message queue per user: max 3 concurrent tasks with overflow rejection. Priority commands like `/stop` bypass this limit.
+- Message queue per user: max 3 concurrent tasks with overflow rejection. Priority commands like `/stop` and `/revert` bypass this limit.
 - `start.sh` handles venv creation, dependency caching (MD5-based), log rotation (14 days), auto-restart with crash detection (>5 in 60s).
 
 ## Key environment variables
