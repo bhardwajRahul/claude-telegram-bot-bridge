@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-05
+
+### Added
+- `/revert` command to restore conversation to any previous message state
+- 5 revert modes: full restore (code + conversation), conversation only, code only, summarize from point, or cancel
+- Paginated history browser showing last 50 messages with inline keyboard navigation
+- Priority handling for `/revert`: bypasses message queue limit and cancels active operations
+- Interactive mode selection via Telegram inline buttons
+- Conversation state restoration by truncating SDK JSONL files to selected message
+
+### Changed
+- Updated documentation (README.md, README-zh.md) with `/revert` usage examples
+- Improved button text consistency: changed "Never mind" to "Cancel"
+
 ## [0.5.0] - 2026-03-05
 
 ### Added
