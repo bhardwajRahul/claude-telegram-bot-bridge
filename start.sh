@@ -46,24 +46,9 @@ check_update() {
     touch "$CACHE_FILE"
     if compare_versions "$current" "$latest"; then
         echo -e "${BLUE}📦 Update available: v${current} → v${latest}${NC}"
-        if [ -t 0 ]; then
-            echo -e "${BOLD}Choose an option:${NC}"
-            echo "  1) Upgrade now"
-            echo "  2) Skip"
-            printf "Enter choice [1-2]: "
-            read -r choice
-            case "$choice" in
-                1)
-                    echo ""
-                    do_upgrade
-                    ;;
-                *)
-                    echo "Skipping upgrade, continuing startup..."
-                    ;;
-            esac
-        else
-            echo -e "${BLUE}   Run: ./start.sh --upgrade${NC}"
-        fi
+        echo -e "${BLUE}   Run: ./start.sh --upgrade${NC}"
+    else
+        echo -e "\033[90m✓ Bridge version: v${current} (up to date)\033[0m"
     fi
 }
 
@@ -160,7 +145,7 @@ EOF
     esac
 done
 
-echo "🤖 Telegram Skill Bot Startup Script"
+echo "🤖 Claude Telegram Bot Bridge"
 echo "================================"
 
 if [ -n "$BOT_DEBUG" ]; then

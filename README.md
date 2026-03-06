@@ -1,4 +1,4 @@
-# Telegram Skill Bot
+# Claude Telegram Bot Bridge
 
 [中文文档](README-zh.md)
 
