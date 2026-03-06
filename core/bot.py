@@ -404,6 +404,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("revert", self._cmd_revert))
         self.application.add_handler(CommandHandler("command", self._cmd_command))
         self.application.add_handler(CommandHandler("cd", self._cmd_cd))
+        self.application.add_handler(CommandHandler("ls", self._cmd_ls))
         self.application.add_handler(CommandHandler("skill", self._cmd_skill))
 
         # Skill command handler - catches all /commands
@@ -1173,6 +1174,57 @@ class TelegramBot:
         if not new_path.is_relative_to(PROJECT_ROOT):
             reply += f"\n\n⚠️ Outside original project root (`{PROJECT_ROOT}`)\nPaths here will require confirmation."
         await update.message.reply_text(reply, parse_mode="Markdown")
+
+    async def _cmd_ls(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update):
+            return
+
+        user_id = update.effective_user.id
+        args = context.args
+
+        current = project_chat_handler.get_user_cwd(user_id)
+
+        if args:
+            path_str = " ".join(args)
+            raw = FilePath(path_str).expanduser()
+            target = (raw if raw.is_absolute() else current / raw).resolve()
+        else:
+            target = current
+
+        if not target.exists():
+            await update.message.reply_text(
+                f"❌ Path not found: `{target}`", parse_mode="Markdown"
+            )
+            return
+        if not target.is_dir():
+            await update.message.reply_text(
+                f"❌ Not a directory: `{target}`", parse_mode="Markdown"
+            )
+            return
+
+        try:
+            entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except PermissionError:
+            await update.message.reply_text(
+                f"❌ Permission denied: `{target}`", parse_mode="Markdown"
+            )
+            return
+
+        if not entries:
+            await update.message.reply_text(
+                f"📂 `{target}`\n\n_(empty directory)_", parse_mode="Markdown"
+            )
+            return
+
+        lines = [f"📂 `{target}`\n"]
+        for entry in entries:
+            lines.append(f"📁 `{entry.name}/`" if entry.is_dir() else f"📄 `{entry.name}`")
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n…_(truncated)_"
+
+        await update.message.reply_text(text, parse_mode="Markdown")
 
     async def _cmd_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /command xxx - forward as Claude Code slash command"""
@@ -2076,6 +2128,7 @@ class TelegramBot:
             BotCommand("skill", "Run skill"),
             BotCommand("command", "Run command"),
             BotCommand("cd", "Change working directory"),
+            BotCommand("ls", "List directory contents"),
         ]
         for scope in (
             BotCommandScopeAllPrivateChats(),
