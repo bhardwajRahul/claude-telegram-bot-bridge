@@ -132,6 +132,12 @@ class VoiceProviderConfigTests(unittest.TestCase):
             )
             self.assertEqual(cfg.volcengine_cluster, "volc_auc_common")
 
+    def test_voice_reply_defaults_are_loaded(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(cfg.voice_reply_persona, "Tingting")
+
 
 if __name__ == "__main__":
     unittest.main()

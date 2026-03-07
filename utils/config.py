@@ -121,6 +121,10 @@ class Config(BaseSettings):
         default=None,
         description="Optional absolute path to ffmpeg binary (defaults to system PATH)",
     )
+    voice_reply_persona: str = Field(
+        default="Tingting",
+        description="Default persona name for voice replies",
+    )
     # Volcengine bigmodel file ASR fields (v3 submit/query)
     volcengine_app_id: Optional[str] = Field(
         default=None, description="Volcengine appid for bigmodel file ASR"
@@ -214,6 +218,14 @@ class Config(BaseSettings):
             return None
         value = str(v).strip()
         return value or None
+
+    @field_validator("voice_reply_persona")
+    @classmethod
+    def normalize_voice_reply_text(cls, v):
+        value = str(v or "").strip()
+        if not value:
+            raise ValueError("VOICE_REPLY_PERSONA must not be empty.")
+        return value
 
     @field_validator(
         "volcengine_app_id",

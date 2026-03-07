@@ -314,12 +314,14 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
             bot._audio_dir = Path(td)
             await bot._handle_voice_message(update, None)
 
-        self.assertTrue(
-            any(msg.startswith("🎤 Voice: ") for msg in update.message.replies)
-        )
         bot._process_user_message_text.assert_awaited_once()
-        called_text = bot._process_user_message_text.await_args.args[2]
+        called = bot._process_user_message_text.await_args
+        called_text = called.args[2]
         self.assertEqual(called_text, "hello from voice")
+        self.assertEqual(called.kwargs.get("message_source"), "voice")
+        self.assertEqual(
+            called.kwargs.get("voice_input_preview"), "🎤 Voice: hello from voice"
+        )
 
     async def test_successful_volcengine_transcription_uses_tos_url(self):
         bot = TelegramBot()
@@ -371,8 +373,12 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
             duration_seconds=30,
         )
         bot._prepare_audio_for_whisper.assert_not_called()
-        self.assertTrue(
-            any(msg.startswith("🎤 Voice: ") for msg in update.message.replies)
+        bot._process_user_message_text.assert_awaited_once()
+        called = bot._process_user_message_text.await_args
+        self.assertEqual(called.kwargs.get("message_source"), "voice")
+        self.assertEqual(
+            called.kwargs.get("voice_input_preview"),
+            "🎤 Voice: hello from volcengine",
         )
 
     async def test_reports_missing_volcengine_configuration(self):

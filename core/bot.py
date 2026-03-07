@@ -46,6 +46,7 @@ from telegram_bot.utils.transcription import (
     VolcengineFileFastTranscriber,
     WhisperTranscriber,
 )
+from telegram_bot.utils.tts import MacOSTtsSynthesizer, VoicePersonaNotAvailableError
 from telegram_bot.utils.tos_uploader import TOSUploadError, VolcengineTOSUploader
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,10 @@ def _esc_md2(text: str) -> str:
 
 
 class TelegramBot:
+    _VOICE_TEXT_CHAR_THRESHOLD = 300
+    _VOICE_LONG_HANZI_THRESHOLD = 1000
+    _VOICE_LONG_ENGLISH_WORD_THRESHOLD = 1000
+
     def __init__(self):
         self.application: Optional[Application] = None
         # Only sessions created/resumed in current runtime are auto-resumed.
@@ -73,6 +78,7 @@ class TelegramBot:
         self._whisper_transcriber: Optional[WhisperTranscriber] = None
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
+        self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
 
     # Available models for /model command
     MODELS = [
@@ -1391,9 +1397,200 @@ class TelegramBot:
             )
         return self._volcengine_tos_uploader
 
+    def _get_tts_synthesizer(self) -> MacOSTtsSynthesizer:
+        if self._tts_synthesizer is None:
+            self._tts_synthesizer = MacOSTtsSynthesizer(
+                ffmpeg_path=config.ffmpeg_path,
+            )
+        return self._tts_synthesizer
+
     @staticmethod
     def _get_transcription_provider() -> str:
         return str(getattr(config, "transcription_provider", "whisper")).strip().lower()
+
+    @staticmethod
+    def _count_hanzi(text: str) -> int:
+        return len(re.findall(r"[\u4e00-\u9fff]", text))
+
+    @staticmethod
+    def _count_english_words(text: str) -> int:
+        return len(re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text))
+
+    def _resolve_next_reply_mode(
+        self, *, current_mode: str, message_source: str, user_text: str
+    ) -> str:
+        del current_mode, user_text
+        if message_source == "voice":
+            return "voice"
+        return "text"
+
+    @staticmethod
+    def _normalize_reply_mode(mode: Optional[str]) -> str:
+        normalized = str(mode or "text").strip().lower()
+        if normalized not in {"text", "voice"}:
+            return "text"
+        return normalized
+
+    def _get_voice_delivery_strategy(self, content: str) -> str:
+        hanzi_count = self._count_hanzi(content)
+        english_word_count = self._count_english_words(content)
+        if (
+            hanzi_count > self._VOICE_LONG_HANZI_THRESHOLD
+            or english_word_count > self._VOICE_LONG_ENGLISH_WORD_THRESHOLD
+        ):
+            return "text_only"
+        if len(content) > self._VOICE_TEXT_CHAR_THRESHOLD:
+            return "voice_and_text"
+        return "voice_only"
+
+    async def _send_voice_message(self, message: Message, content: str) -> None:
+        tts = self._get_tts_synthesizer()
+        persona = getattr(config, "voice_reply_persona", "")
+        voice_path: Optional[FilePath] = None
+        cleanup_paths: List[FilePath] = []
+        selected_voice = ""
+        try:
+            (
+                voice_path,
+                cleanup_paths,
+                selected_voice,
+            ) = await tts.synthesize_to_telegram_voice(
+                text=content,
+                output_dir=self._audio_dir,
+                persona=persona,
+            )
+            with open(voice_path, "rb") as voice_stream:
+                await message.reply_voice(voice=voice_stream)
+            logger.info(
+                "Voice reply sent persona=%s selected_voice=%s output=%s",
+                persona,
+                selected_voice,
+                voice_path,
+            )
+        finally:
+            await self._audio_processor.cleanup_audio_files(cleanup_paths)
+
+    async def _send_content_artifacts(
+        self, message: Message, content: str, force_options: bool
+    ) -> None:
+        resolved_paths = self._resolve_paths(content)
+        in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
+        await self._send_file_paths(message.chat.id, in_root_paths)
+
+        if force_options:
+            options = self._extract_options(content)
+            kb = self._build_option_keyboard(options)
+            if kb:
+                await message.reply_text("Please select:", reply_markup=kb)
+
+    @staticmethod
+    def _merge_voice_preview(content: str, voice_input_preview: Optional[str]) -> str:
+        preview = str(voice_input_preview or "").strip()
+        if not preview:
+            return content
+        body = str(content or "").strip()
+        if not body:
+            return preview
+        return f"{preview}\n\n{body}"
+
+    async def _send_reply_by_mode(
+        self,
+        *,
+        message: Message,
+        user_id: int,
+        content: str,
+        parse_mode: str,
+        force_options: bool,
+        streamed: bool,
+        reply_mode: str,
+        voice_input_preview: Optional[str] = None,
+    ) -> None:
+        content_with_preview = self._merge_voice_preview(content, voice_input_preview)
+        preview_text = str(voice_input_preview or "").strip()
+        preview_sent_first = False
+        if reply_mode != "voice":
+            await self._reply_smart(
+                message,
+                content_with_preview,
+                parse_mode=parse_mode,
+                force_options=force_options,
+                streamed=streamed,
+            )
+            return
+
+        strategy = self._get_voice_delivery_strategy(content)
+        if strategy == "text_only":
+            logger.info(
+                "Voice reply text-only fallback user_id=%s reason=long_reply hanzi_count=%s english_word_count=%s char_count=%s",
+                user_id,
+                self._count_hanzi(content),
+                self._count_english_words(content),
+                len(content),
+            )
+            await self._reply_smart(
+                message,
+                content_with_preview,
+                parse_mode=parse_mode,
+                force_options=force_options,
+                streamed=streamed,
+            )
+            return
+
+        try:
+            if strategy == "voice_only" and preview_text:
+                await message.reply_text(preview_text)
+                preview_sent_first = True
+            await self._send_voice_message(message, content)
+        except VoicePersonaNotAvailableError as exc:
+            error_message = (
+                f"❌ 当前配置的 VOICE_REPLY_PERSONA=`{exc.persona}` 在本机不可用。\n"
+                "建议执行 `say -v ?` 查看完整可用音色。\n"
+                "请将 VOICE_REPLY_PERSONA 设置为输出第一列中的名称。"
+            )
+            await message.reply_text(error_message, parse_mode="Markdown")
+            logger.error(
+                "Voice reply persona unavailable user_id=%s persona=%s available_voice_count=%s",
+                user_id,
+                exc.persona,
+                len(exc.available_voices),
+            )
+            fallback_content = content if preview_sent_first else content_with_preview
+            await self._reply_smart(
+                message,
+                fallback_content,
+                parse_mode=parse_mode,
+                force_options=force_options,
+                streamed=streamed,
+            )
+            return
+        except Exception as exc:
+            logger.error(
+                "Voice reply synthesis failed user_id=%s fallback=text error=%s",
+                user_id,
+                exc,
+                exc_info=True,
+            )
+            fallback_content = content if preview_sent_first else content_with_preview
+            await self._reply_smart(
+                message,
+                fallback_content,
+                parse_mode=parse_mode,
+                force_options=force_options,
+                streamed=streamed,
+            )
+            return
+
+        if strategy == "voice_and_text":
+            await self._reply_smart(
+                message,
+                content_with_preview,
+                parse_mode=parse_mode,
+                force_options=force_options,
+                streamed=streamed,
+            )
+            return
+
+        await self._send_content_artifacts(message, content, force_options)
 
     @staticmethod
     def _redact_telegram_file_url(url: str) -> str:
@@ -1452,12 +1649,32 @@ class TelegramBot:
         return converted
 
     async def _process_user_message_text(
-        self, update: Update, user_id: int, text: str
+        self,
+        update: Update,
+        user_id: int,
+        text: str,
+        message_source: str = "text",
+        voice_input_preview: Optional[str] = None,
     ) -> None:
         message = self._require_message(update)
         chat = self._require_chat(update)
         app = self._require_application()
         current_session = await session_manager.get_session(user_id)
+        current_reply_mode = self._normalize_reply_mode(
+            current_session.get("reply_mode")
+        )
+        next_reply_mode = self._resolve_next_reply_mode(
+            current_mode=current_reply_mode,
+            message_source=message_source,
+            user_text=text,
+        )
+        if current_reply_mode != next_reply_mode:
+            current_session["reply_mode"] = next_reply_mode
+            await session_manager.update_session(
+                user_id, {"reply_mode": next_reply_mode}
+            )
+        else:
+            current_session["reply_mode"] = current_reply_mode
         try:
             await message.chat.send_action(action="typing")
         except Exception:
@@ -1468,6 +1685,7 @@ class TelegramBot:
             if new_session:
                 await session_manager.update_session(user_id, current_session)
 
+            enable_streaming_text = next_reply_mode != "voice"
             response = await project_chat_handler.process_message(
                 user_message=text,
                 user_id=user_id,
@@ -1478,15 +1696,18 @@ class TelegramBot:
                 new_session=new_session,
                 permission_callback=self._permission_callback,
                 typing_callback=lambda: message.chat.send_action(action="typing"),
-                bot=app.bot,
+                bot=app.bot if enable_streaming_text else None,
             )
             await self._save_session_id(user_id, response)
-            await self._reply_smart(
-                message,
-                response.content,
+            await self._send_reply_by_mode(
+                message=message,
+                user_id=user_id,
+                content=response.content,
                 parse_mode="Markdown",
                 force_options=response.has_options,
                 streamed=response.streamed,
+                reply_mode=next_reply_mode,
+                voice_input_preview=voice_input_preview,
             )
         except asyncio.CancelledError:
             # Task was cancelled by /stop command - silently exit
@@ -1725,8 +1946,13 @@ class TelegramBot:
                     return
 
                 preview = f"🎤 Voice: {text}"
-                await message.reply_text(preview)
-                await self._process_user_message_text(update, user_id, text)
+                await self._process_user_message_text(
+                    update,
+                    user_id,
+                    text,
+                    message_source="voice",
+                    voice_input_preview=preview,
+                )
                 outcome = "success"
             except asyncio.CancelledError:
                 outcome = "cancelled"
@@ -2116,17 +2342,7 @@ class TelegramBot:
                 except Exception:
                     await message.reply_text(part)
 
-        # Send files mentioned in the response
-        resolved_paths = self._resolve_paths(content)
-        in_root_paths, _ = self._split_paths_by_scope(resolved_paths)
-        await self._send_file_paths(message.chat.id, in_root_paths)
-
-        # Only show inline keyboard for AskUserQuestion degraded content
-        if force_options:
-            options = self._extract_options(content)
-            kb = self._build_option_keyboard(options)
-            if kb:
-                await message.reply_text("Please select:", reply_markup=kb)
+        await self._send_content_artifacts(message, content, force_options)
 
     async def _send_smart(
         self,

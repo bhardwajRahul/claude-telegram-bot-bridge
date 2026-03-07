@@ -251,6 +251,7 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `VOLCENGINE_TOS_ENDPOINT` | Volcengine only | — | TOS endpoint (must match your bucket region, e.g. `https://tos-cn-shanghai.volces.com`) |
 | `VOLCENGINE_TOS_REGION` | No | `cn-beijing` | TOS region used by SDK signing |
 | `FFMPEG_PATH` | No | *(auto-detect)* | Absolute path to ffmpeg binary |
+| `VOICE_REPLY_PERSONA` | No | `Tingting` | Persona name used by voice reply mode |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `PROXY_URL` | No | — | HTTP proxy; auto-configures `http_proxy`/`https_proxy`/`all_proxy` |
 
@@ -268,6 +269,24 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 - Secret Access Key must be created in Volcengine IAM key management:
   - `https://console.volcengine.com/iam/keymanage`
 - In Volcengine mode, the bot now uses `download -> TOS upload -> signed TOS URL -> ASR`.
+
+## Voice Reply Mode (macOS)
+
+- User voice messages switch reply mode to voice automatically.
+- User text messages switch reply mode back to text.
+- In voice mode:
+  - `>1000` Chinese characters or `>1000` English words: text only (voice mode is kept)
+  - `>300` characters (and not over 1000 threshold): send voice + text
+  - Otherwise: send voice only
+- Voice transcription preview (`🎤 Voice: ...`) is bundled with the final reply:
+  - if text is sent, preview is merged at the top of that same text message
+  - if voice-only reply is sent, the bot sends preview text first, then voice
+- The bot uses macOS `say` for synthesis, then converts output to Telegram-compatible `ogg/opus` via `ffmpeg`.
+- `VOICE_REPLY_PERSONA` should be a real macOS voice name from `say -v ?`.
+- If `VOICE_REPLY_PERSONA` is unavailable on current system, the bot sends a friendly error and falls back to text for that reply.
+- Set `VOICE_REPLY_PERSONA` to the first-column name shown by `say -v ?`.
+- Example:
+  - `VOICE_REPLY_PERSONA=Tingting`
 
 ## ffmpeg Installation
 

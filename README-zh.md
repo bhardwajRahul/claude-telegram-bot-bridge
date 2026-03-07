@@ -248,6 +248,7 @@ Claude:  ...
 | `VOLCENGINE_TOS_ENDPOINT` | 火山渠道必需 | — | TOS 节点地址（必须与你的 Bucket 区域匹配，如 `https://tos-cn-shanghai.volces.com`） |
 | `VOLCENGINE_TOS_REGION` | 否 | `cn-beijing` | TOS SDK 使用的 region |
 | `FFMPEG_PATH` | 否 | *（自动检测）* | ffmpeg 二进制绝对路径 |
+| `VOICE_REPLY_PERSONA` | 否 | `Tingting` | 语音回复模式使用的人设名称 |
 | `LOG_LEVEL` | 否 | `INFO` | 日志级别 |
 | `PROXY_URL` | 否 | — | HTTP 代理；自动配置 `http_proxy`/`https_proxy`/`all_proxy` |
 
@@ -265,6 +266,25 @@ Claude:  ...
 - Secret Access Key 需要在火山 IAM 控制台创建：
   - `https://console.volcengine.com/iam/keymanage`
 - 火山渠道下，Bot 现在走 `下载 Telegram 语音 -> 上传 TOS -> 传递签名 TOS URL -> ASR`。
+
+## macOS 语音回复模式
+
+- 用户发送语音消息时，回复模式会自动切到语音。
+- 用户发送文本消息时，回复模式会自动切回文本。
+- 语音模式分流规则：
+  - `>1000` 个汉字或 `>1000` 个英文单词：本次仅发文本（保持语音模式）
+  - `>300` 字符且未触发 1000 阈值：语音 + 文本双发
+  - 其他情况：仅发语音
+- 语音转写预览（`🎤 Voice: ...`）会和最终回复一起发送：
+  - 若本次有文本回复，会合并到同一条文本消息顶部
+  - 若本次仅发语音，会先发预览文本，再发语音
+- 语音合成链路为：macOS `say` 合成 + `ffmpeg` 转为 Telegram 兼容的 `ogg/opus`。
+- `VOICE_REPLY_PERSONA` 需要填写系统实际可用音色名（可通过 `say -v ?` 查看）。
+- 若 `VOICE_REPLY_PERSONA` 在当前系统不可用，机器人会返回友好错误提示，并回退为文本回复本条消息。
+- 常见系统自带音色示例：`Tingting`、`Mei-Jia`、`Sin-ji`、`Samantha`、`Alex`、`Daniel`、`Karen`、`Moira`。
+- 示例：
+  - `VOICE_REPLY_PERSONA=Tingting`
+- 建议：中文场景如果系统可用，`Yue (Premium)` 通常会更自然。
 
 ## ffmpeg 安装
 
