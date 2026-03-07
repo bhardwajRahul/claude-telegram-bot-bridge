@@ -332,7 +332,7 @@ class Config(BaseSettings):
 
 
 # Global config instance
-config = Config()
+config = Config()  # type: ignore[call-arg]
 
 
 def setup_logging() -> None:

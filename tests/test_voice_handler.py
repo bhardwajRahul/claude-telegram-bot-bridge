@@ -1,4 +1,5 @@
 # ruff: noqa: E402
+# mypy: disable-error-code=attr-defined
 
 import asyncio
 import sys

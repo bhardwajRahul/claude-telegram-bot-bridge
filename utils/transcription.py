@@ -58,7 +58,7 @@ class WhisperTranscriber:
             raise ValueError("OPENAI_API_KEY is required for voice transcription.")
 
         if client_factory is not None:
-            kwargs = {"api_key": self.api_key}
+            kwargs: dict[str, Any] = {"api_key": self.api_key}
             if self.base_url:
                 kwargs["base_url"] = self.base_url
             self.client = client_factory(**kwargs)
@@ -72,10 +72,10 @@ class WhisperTranscriber:
             ) from exc
 
         if hasattr(openai, "AsyncOpenAI"):
-            kwargs = {"api_key": self.api_key}
+            client_kwargs: dict[str, Any] = {"api_key": self.api_key}
             if self.base_url:
-                kwargs["base_url"] = self.base_url
-            self.client = openai.AsyncOpenAI(**kwargs)
+                client_kwargs["base_url"] = self.base_url
+            self.client = openai.AsyncOpenAI(**client_kwargs)
         else:
             openai.api_key = self.api_key
             if self.base_url:

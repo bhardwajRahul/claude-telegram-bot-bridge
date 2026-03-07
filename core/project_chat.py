@@ -44,7 +44,7 @@ def _patch_sdk_cli_resolution() -> None:
     def patched_find_cli(self):
         return cli_path
 
-    SubprocessCLITransport._find_cli = patched_find_cli
+    setattr(SubprocessCLITransport, "_find_cli", patched_find_cli)
     setattr(SubprocessCLITransport, marker, True)
     logger.info(f"Patched SDK CLI resolution to use configured path: {cli_path}")
 
@@ -118,8 +118,8 @@ def _detect_numbered_options(text: str) -> bool:
 
 # Callback type: async (chat_id, user_id, tool_name, tool_input) -> bool | PermissionResult
 PermissionCallback = Callable[[int, int, str, Dict[str, Any]], Awaitable]
-# Callback type: async () -> None, sends typing action
-TypingCallback = Callable[[], Awaitable[None]]
+# Callback type: async () -> Any, sends typing action
+TypingCallback = Callable[[], Awaitable[Any]]
 
 TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
 
@@ -678,7 +678,9 @@ class ProjectChatHandler:
             # Close SDK client
             try:
                 if state.client:
-                    asyncio.create_task(state.client.close())
+                    close_fn = getattr(state.client, "close", None)
+                    if callable(close_fn):
+                        asyncio.create_task(close_fn())
             except Exception as e:
                 logger.error(f"Error closing SDK client for user {user_id}: {e}")
             # Remove from streams dict
@@ -691,8 +693,8 @@ class ProjectChatHandler:
         if state:
             # Clear any pending permission requests
             for req in list(state.pending):
-                if req.permission_future and not req.permission_future.done():
-                    req.permission_future.cancel()
+                if req.future and not req.future.done():
+                    req.future.cancel()
             logger.info(f"Cleared pending permissions for user {user_id}")
 
     def list_sessions(self, limit: int = 10) -> List[Tuple[str, str, float]]:
