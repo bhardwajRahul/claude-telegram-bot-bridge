@@ -73,6 +73,18 @@ ALLOWED_TOOLS = [
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "600"))
 
+_RETRYABLE_PATTERNS = [
+    "exit code -15",  # SIGTERM
+    "exit code -9",  # SIGKILL
+    "ConnectionRefused",
+    "Unable to connect to API",
+]
+
+
+def _is_retryable_sdk_error(error_msg: str) -> bool:
+    """Check if the SDK error is transient and worth retrying."""
+    return any(p in error_msg for p in _RETRYABLE_PATTERNS)
+
 
 def _format_ask_user_question(tool_input: dict):
     """Degrade AskUserQuestion to plain text for bot delivery.
@@ -627,8 +639,65 @@ class ProjectChatHandler:
                     state.pending.remove(request)
                 except ValueError:
                     pass
-            logger.error(f"Error processing message: {e}", exc_info=True)
+
             err = str(e)
+
+            # Retry once for transient SDK errors (SIGTERM, ConnectionRefused, etc.)
+            if _is_retryable_sdk_error(err):
+                logger.warning(
+                    "Retryable SDK error for user %s: %s — reconnecting and retrying",
+                    user_id,
+                    err,
+                )
+                await self._disconnect_user_stream(user_id)
+
+                retry_future: asyncio.Future = loop.create_future()
+                retry_handler = None
+                if bot:
+                    from telegram_bot.core.streaming import StreamingMessageHandler
+
+                    retry_handler = StreamingMessageHandler(bot, chat_id, user_id)
+                retry_request = _PendingRequest(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    model=model,
+                    requested_session_id=session_id,
+                    permission_callback=permission_callback,
+                    typing_callback=typing_callback,
+                    future=retry_future,
+                    streaming_handler=retry_handler,
+                )
+                try:
+                    retry_state = await self._get_or_create_stream(
+                        user_id, model, new_session=False
+                    )
+                    async with retry_state.send_lock:
+                        retry_request.sent_session_id = (
+                            session_id or retry_state.last_session_id or "default"
+                        )
+                        retry_state.pending.append(retry_request)
+                        await retry_state.client.query(
+                            user_message, session_id=retry_request.sent_session_id
+                        )
+                        logger.info("Retry submitted for user %s", user_id)
+                    return await asyncio.wait_for(
+                        retry_future, timeout=PROCESS_TIMEOUT
+                    )
+                except Exception as retry_err:
+                    logger.error(
+                        "Retry also failed for user %s: %s",
+                        user_id,
+                        retry_err,
+                        exc_info=True,
+                    )
+                    retry_msg = str(retry_err)
+                    return ChatResponse(
+                        content=f"❌ Error: {retry_msg}",
+                        success=False,
+                        error=retry_msg,
+                    )
+
+            logger.error(f"Error processing message: {e}", exc_info=True)
             return ChatResponse(content=f"❌ Error: {err}", success=False, error=err)
 
         finally:

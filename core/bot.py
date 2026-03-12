@@ -137,17 +137,26 @@ class TelegramBot:
         self._setup_handlers()
         self.application.add_error_handler(self._error_handler)
 
-    def run(self):
-        """Run the bot with built-in signal handling and graceful shutdown"""
-        if not self.application:
-            self.build()
+    _MIN_UPTIME = 30  # seconds — polling exits faster → count as crash
+    _MAX_RAPID_CRASHES = 5
 
-        logger.info("⏳ Starting...")
-        retry_count = 0
-        while retry_count < config.network_retry_attempts:
+    def run(self):
+        """Run the bot with auto-restart on unexpected polling exits.
+
+        When run_polling() returns normally (e.g. SDK crash triggers graceful
+        shutdown), the application is rebuilt and polling restarts automatically.
+        Only gives up after _MAX_RAPID_CRASHES consecutive short-lived sessions.
+        """
+        rapid_crash_count = 0
+
+        while True:
+            if not self.application:
+                self.build()
+
+            logger.info("⏳ Starting...")
+            start_time = time.time()
             try:
                 self.application.run_polling()
-                break
             except telegram.error.InvalidToken:
                 raise SystemExit(
                     "❌ Invalid Telegram Bot Token. "
@@ -160,24 +169,42 @@ class TelegramBot:
                     "   Use --stop to stop it first, or check for duplicate processes."
                 )
             except telegram.error.NetworkError as e:
-                retry_count += 1
-                if retry_count >= config.network_retry_attempts:
-                    raise SystemExit(
-                        f"❌ Network error after {config.network_retry_attempts} attempts: {e}\n"
-                        "   Check your internet connection and PROXY_URL settings."
-                    )
                 logger.warning(
-                    f"Network error (attempt {retry_count}/{config.network_retry_attempts}): {e}. "
-                    f"Retrying in {config.network_retry_delay}s..."
+                    "Network error: %s. Retrying in %ss...",
+                    e,
+                    config.network_retry_delay,
                 )
                 time.sleep(config.network_retry_delay)
+                self.application = None
+                continue
             except telegram.error.Forbidden as e:
                 raise SystemExit(
                     f"❌ Bot token was revoked or bot is blocked: {e}\n"
                     "   Create a new token via @BotFather on Telegram."
                 )
 
-        logger.info("Bot stopped")
+            # run_polling() returned normally — check uptime to detect crash loops
+            uptime = time.time() - start_time
+            if uptime < self._MIN_UPTIME:
+                rapid_crash_count += 1
+                if rapid_crash_count >= self._MAX_RAPID_CRASHES:
+                    raise SystemExit(
+                        f"❌ Polling exited {self._MAX_RAPID_CRASHES} times within "
+                        f"{self._MIN_UPTIME}s each. Giving up."
+                    )
+                logger.warning(
+                    "Polling exited after only %.1fs (crash %d/%d), restarting in %ds...",
+                    uptime,
+                    rapid_crash_count,
+                    self._MAX_RAPID_CRASHES,
+                    config.network_retry_delay,
+                )
+            else:
+                rapid_crash_count = 0
+                logger.warning("Polling exited after %.1fs, restarting...", uptime)
+
+            time.sleep(config.network_retry_delay)
+            self.application = None  # force rebuild for clean state
 
     def _check_user_access(self, user_id: int) -> bool:
         """Check if user has permission to use the bot"""

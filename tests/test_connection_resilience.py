@@ -67,45 +67,60 @@ class TestConnectionResilience(unittest.TestCase):
         mock_builder.get_updates_pool_timeout.assert_called_once_with(5)
 
     @patch('time.sleep')
-    def test_network_error_retries_then_succeeds(self, mock_sleep):
-        """Test that NetworkError triggers retry and eventually succeeds."""
-        self.bot.build()
-
-        # Mock run_polling to fail once, then succeed
+    def test_network_error_retries_with_rebuild(self, mock_sleep):
+        """Test that NetworkError triggers application rebuild and retry."""
+        mock_app = Mock()
         call_count = 0
+
         def mock_run_polling(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise telegram.error.NetworkError("Connection reset")
-            # Second call succeeds (returns normally)
+            # Exit cleanly on second call
+            raise telegram.error.InvalidToken("test exit")
 
-        self.bot.application.run_polling = Mock(side_effect=mock_run_polling)
+        mock_app.run_polling = Mock(side_effect=mock_run_polling)
 
-        # Should not raise SystemExit
-        self.bot.run()
+        build_count = 0
+        def mock_build():
+            nonlocal build_count
+            build_count += 1
+            self.bot.application = mock_app
 
-        # Verify retry happened
-        self.assertEqual(call_count, 2)
-        mock_sleep.assert_called_once_with(5)
+        self.bot.build = mock_build
+        self.bot.application = mock_app
 
-    @patch('time.sleep')
-    def test_network_error_exits_after_max_retries(self, mock_sleep):
-        """Test that NetworkError causes SystemExit after max retries."""
-        self.bot.build()
-
-        # Mock run_polling to always fail
-        self.bot.application.run_polling = Mock(
-            side_effect=telegram.error.NetworkError("Connection reset")
-        )
-
-        # Should raise SystemExit after 3 attempts
         with self.assertRaises(SystemExit):
             self.bot.run()
 
-        # Verify all retries were attempted
-        self.assertEqual(self.bot.application.run_polling.call_count, 3)
-        self.assertEqual(mock_sleep.call_count, 2)  # Sleep between attempts
+        # NetworkError triggered rebuild and retry
+        self.assertEqual(call_count, 2)
+        self.assertGreaterEqual(build_count, 1)
+        mock_sleep.assert_called_with(5)
+
+    @patch('time.sleep')
+    @patch('time.time')
+    def test_rapid_crash_triggers_system_exit(self, mock_time, mock_sleep):
+        """Test that repeated rapid polling exits trigger SystemExit."""
+        # Each iteration calls time.time() twice: before and after run_polling
+        # Uptime of 1s each (< MIN_UPTIME=30) counts as rapid crash
+        mock_time.side_effect = list(range(20))
+
+        mock_app = Mock()
+        mock_app.run_polling = Mock()  # returns normally (simulates graceful shutdown)
+
+        def mock_build():
+            self.bot.application = mock_app
+
+        self.bot.build = mock_build
+        self.bot.application = mock_app
+
+        with self.assertRaises(SystemExit):
+            self.bot.run()
+
+        # Should exit after MAX_RAPID_CRASHES (5) consecutive rapid exits
+        self.assertEqual(mock_app.run_polling.call_count, 5)
 
 
 if __name__ == '__main__':
