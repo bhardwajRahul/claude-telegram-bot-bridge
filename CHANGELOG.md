@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-03-12
+
+### Fixed
+- Auto-restart Telegram polling after unexpected exit (e.g. SDK crash triggering graceful shutdown) instead of silently stopping message reception
+- Retry transient SDK errors (SIGTERM, SIGKILL, ConnectionRefused) once with automatic reconnection in `process_message`
+- NetworkError now retries indefinitely with application rebuild instead of giving up after fixed attempts
+- Rapid crash protection: exits only after 5 consecutive polling failures within 30 seconds each
+
 ## [0.8.3] - 2026-03-12
 
 ### Fixed
