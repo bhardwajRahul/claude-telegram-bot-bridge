@@ -73,19 +73,55 @@ ALLOWED_TOOLS = [
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "600"))
 
-_RETRYABLE_PATTERNS = [
-    "exit code -15",  # SIGTERM
-    "exit code -9",  # SIGKILL
-    "ConnectionRefused",
-    "Unable to connect to API",
-    "Control request timeout",  # SDK initialization timeout
-    "TimeoutError",  # Generic timeout errors
-]
+def _is_retryable_sdk_error(error: Exception) -> bool:
+    """Check if the SDK error is transient and worth retrying.
 
+    Returns True for network/timeout errors, False for permanent errors like
+    configuration issues, permission errors, or code bugs.
+    """
+    error_type = type(error).__name__
+    error_msg = str(error)
 
-def _is_retryable_sdk_error(error_msg: str) -> bool:
-    """Check if the SDK error is transient and worth retrying."""
-    return any(p in error_msg for p in _RETRYABLE_PATTERNS)
+    # Permanent errors that should NOT be retried
+    NON_RETRYABLE_PATTERNS = [
+        "Invalid token",
+        "Permission denied",
+        "No such file",
+        "Configuration error",
+        "AttributeError",
+        "KeyError",
+        "ValueError",
+        "TypeError",
+    ]
+
+    # Check if it's a permanent error
+    if any(pattern in error_msg for pattern in NON_RETRYABLE_PATTERNS):
+        return False
+
+    # Retry all timeout and connection errors by default
+    RETRYABLE_TYPES = [
+        "TimeoutError",
+        "ConnectionError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "BrokenPipeError",
+        "OSError",
+    ]
+
+    if error_type in RETRYABLE_TYPES:
+        return True
+
+    # Also retry if error message contains common transient error patterns
+    RETRYABLE_MSG_PATTERNS = [
+        "timeout",
+        "connection",
+        "refused",
+        "unreachable",
+        "exit code -15",  # SIGTERM
+        "exit code -9",   # SIGKILL
+    ]
+
+    return any(pattern in error_msg.lower() for pattern in RETRYABLE_MSG_PATTERNS)
 
 
 def _format_ask_user_question(tool_input: dict):
@@ -648,8 +684,8 @@ class ProjectChatHandler:
                 exc_info=True
             )
 
-            # Retry once for transient SDK errors (SIGTERM, ConnectionRefused, etc.)
-            is_retryable = _is_retryable_sdk_error(err)
+            # Retry once for transient SDK errors (network/timeout errors)
+            is_retryable = _is_retryable_sdk_error(e)
             logger.info(
                 f"Error retryability check for user {user_id}: "
                 f"is_retryable={is_retryable}, error='{err[:100]}...'"
