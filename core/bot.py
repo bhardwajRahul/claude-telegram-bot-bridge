@@ -183,6 +183,10 @@ class TelegramBot:
                     "Another bot instance is already running with the same token.\n"
                     "   Use --stop to stop it first, or check for duplicate processes."
                 )
+            except telegram.error.NetworkError as e:
+                logger.warning("Network error during initialization: %s, retrying...", e)
+                await asyncio.sleep(5)
+                continue
 
             await self._on_ready(self.application)
 
