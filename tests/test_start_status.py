@@ -29,12 +29,29 @@ class StartStatusTests(unittest.TestCase):
             check=False,
         )
 
+    def _run_stop(
+        self, project_root: Path, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(self.start_script), str(project_root), "--stop"],
+            cwd=self.repo_root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+
     def _prepare_project(self, tmpdir: str) -> Path:
         project_root = Path(tmpdir)
         bot_dir = project_root / ".telegram_bot"
         logs_dir = bot_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         return project_root
+
+    def _write_bot_log(self, project_root: Path, *lines: str) -> Path:
+        bot_log = project_root / ".telegram_bot" / "logs" / "bot.log"
+        bot_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return bot_log
 
     def _prepare_script_workspace(self, tmpdir: str) -> Path:
         script_root = Path(tmpdir) / "bridge"
@@ -132,23 +149,23 @@ class StartStatusTests(unittest.TestCase):
             self.assertIn("common causes:", result.stdout)
             self.assertFalse(pid_file.exists(), "stale pid file should be cleaned up")
 
-    def test_status_running_but_inactive(self):
+    def test_status_running_but_idle(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = self._prepare_project(tmpdir)
             pid_file = project_root / ".telegram_bot" / "bot.pid"
             pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
-            bot_log = project_root / ".telegram_bot" / "logs" / "bot.log"
-            bot_log.write_text("old log\n", encoding="utf-8")
+            bot_log = self._write_bot_log(project_root, "old log")
             old = int(time.time()) - 2 * 60 * 60
             os.utime(bot_log, (old, old))
 
             result = self._run_status(project_root)
 
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("Bot status: unavailable", result.stdout)
-            self.assertIn("inactive for", result.stdout)
-            self.assertIn("common causes:", result.stdout)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: running", result.stdout)
+            self.assertIn("Process: alive", result.stdout)
+            self.assertIn("Activity: idle for", result.stdout)
+            self.assertNotIn("unavailable", result.stdout)
 
     def test_status_running_and_healthy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -156,13 +173,15 @@ class StartStatusTests(unittest.TestCase):
             pid_file = project_root / ".telegram_bot" / "bot.pid"
             pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
-            bot_log = project_root / ".telegram_bot" / "logs" / "bot.log"
-            bot_log.write_text("fresh log\n", encoding="utf-8")
+            self._write_bot_log(project_root, "fresh log")
 
             result = self._run_status(project_root)
 
             self.assertEqual(result.returncode, 0)
             self.assertIn("Bot status: running", result.stdout)
+            self.assertIn("Process: alive", result.stdout)
+            self.assertIn("Telegram: healthy", result.stdout)
+            self.assertIn("Claude: healthy", result.stdout)
             self.assertNotIn("unavailable", result.stdout)
 
     def test_status_prefers_heartbeat_over_stale_log(self):
@@ -171,8 +190,7 @@ class StartStatusTests(unittest.TestCase):
             pid_file = project_root / ".telegram_bot" / "bot.pid"
             pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
-            bot_log = project_root / ".telegram_bot" / "logs" / "bot.log"
-            bot_log.write_text("old log\n", encoding="utf-8")
+            bot_log = self._write_bot_log(project_root, "old log")
             old = int(time.time()) - 2 * 60 * 60
             os.utime(bot_log, (old, old))
 
@@ -184,6 +202,105 @@ class StartStatusTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("Bot status: running", result.stdout)
             self.assertIn("last heartbeat", result.stdout)
+
+    def test_status_uses_newer_log_when_heartbeat_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            pid_file = project_root / ".telegram_bot" / "bot.pid"
+            pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+            self._write_bot_log(project_root, "fresh log")
+
+            heartbeat = project_root / ".telegram_bot" / "bot.heartbeat"
+            heartbeat.write_text("", encoding="utf-8")
+            old = int(time.time()) - 2 * 60 * 60
+            os.utime(heartbeat, (old, old))
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: running", result.stdout)
+            self.assertIn("last log update", result.stdout)
+
+    def test_status_reports_telegram_degraded_from_recent_log(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            pid_file = project_root / ".telegram_bot" / "bot.pid"
+            pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+            self._write_bot_log(
+                project_root,
+                "2026-03-20 03:10:00,000 - telegram_bot.core.bot - WARNING - Telegram API unreachable (300s): Timed out",
+            )
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: running", result.stdout)
+            self.assertIn("Telegram: degraded", result.stdout)
+            self.assertIn("Timed out", result.stdout)
+            self.assertNotIn("unavailable", result.stdout)
+
+    def test_status_reports_claude_degraded_but_retryable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            pid_file = project_root / ".telegram_bot" / "bot.pid"
+            pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+            self._write_bot_log(
+                project_root,
+                '2026-03-20 03:11:00,000 - telegram_bot.core.project_chat - ERROR - SDK returned error: Failed to authenticate. API Error: 403 {"error":{"message":"","type":"upstream_error"}}',
+            )
+
+            result = self._run_status(project_root)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Bot status: running", result.stdout)
+            self.assertIn("Claude: degraded", result.stdout)
+            self.assertIn("403", result.stdout)
+            self.assertIn("retry", result.stdout.lower())
+            self.assertNotIn("unavailable", result.stdout)
+
+    def test_stop_boots_out_launchd_service_when_installed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            fake_bin = Path(tmpdir) / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            launchctl_log = Path(tmpdir) / "launchctl.log"
+            self._make_fake_launchctl(fake_bin, launchctl_log)
+
+            fake_home = Path(tmpdir) / "home"
+            project_slug = re.sub(r"[^a-z0-9]+", "-", project_root.name.lower()).rstrip(
+                "-"
+            )
+            plist_file = (
+                fake_home
+                / "Library"
+                / "LaunchAgents"
+                / f"com.telegram-skill-bot.{project_slug}.plist"
+            )
+            plist_file.parent.mkdir(parents=True, exist_ok=True)
+            plist_file.write_text("<plist/>", encoding="utf-8")
+
+            sleeper = subprocess.Popen(["sleep", "30"])
+            try:
+                pid_file = project_root / ".telegram_bot" / "bot.pid"
+                pid_file.write_text(f"{sleeper.pid}\n", encoding="utf-8")
+
+                env = os.environ.copy()
+                env["HOME"] = str(fake_home)
+                env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+                result = self._run_stop(project_root, env=env)
+            finally:
+                if sleeper.poll() is None:
+                    sleeper.terminate()
+                    sleeper.wait(timeout=5)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("launchd service stopped", result.stdout)
+            self.assertFalse(pid_file.exists())
+            self.assertIn("bootout", launchctl_log.read_text(encoding="utf-8"))
 
     def test_interactive_token_entry_updates_env_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

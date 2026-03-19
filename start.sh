@@ -237,6 +237,59 @@ get_mtime_epoch() {
     stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null
 }
 
+format_age_compact() {
+    local age_seconds="$1"
+    if [ "$age_seconds" -ge 3600 ]; then
+        printf '%sh' $((age_seconds / 3600))
+    elif [ "$age_seconds" -ge 60 ]; then
+        printf '%sm' $((age_seconds / 60))
+    else
+        printf '%ss' "$age_seconds"
+    fi
+}
+
+extract_log_message() {
+    local line="$1"
+    printf '%s\n' "$line" | sed -E 's/^[0-9-]+ [0-9:,]+ - [^-]+ - [A-Z]+ - //'
+}
+
+get_last_log_match() {
+    local file="$1"
+    local pattern="$2"
+    [ -f "$file" ] || return 1
+    grep -E "$pattern" "$file" | tail -n 1
+}
+
+log_line_age_seconds() {
+    local line="$1"
+    [ -n "$line" ] || return 1
+    python3 - "$line" <<'PY'
+import sys
+from datetime import datetime
+
+line = sys.argv[1]
+prefix = " - ".join(line.split(" - ")[:3])
+try:
+    ts = prefix.split(" - ", 1)[0]
+    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S,%f")
+except Exception:
+    sys.exit(1)
+
+print(int((datetime.now() - dt).total_seconds()))
+PY
+}
+
+print_component_status() {
+    local component="$1"
+    local state="$2"
+    local detail="$3"
+    printf '   %s: %s' "$component" "$state"
+    if [ -n "$detail" ]; then
+        printf ' (%s)' "$detail"
+    fi
+    printf '\n'
+}
+
 # ── Action handlers ──
 
 do_status() {
@@ -250,37 +303,75 @@ do_status() {
         local heartbeat_file="$BOT_DATA_DIR/bot.heartbeat"
         local bot_log="$LOGS_DIR/bot.log"
         local activity_file activity_label
-        local now mtime age_seconds age_minutes
+        local now mtime age_seconds
+        local heartbeat_mtime="" bot_log_mtime=""
         local inactive_after_seconds="${STATUS_INACTIVE_SECONDS:-900}"
+        local telegram_line telegram_age telegram_detail
+        local claude_line claude_age claude_detail
 
         if [ -f "$heartbeat_file" ]; then
-            activity_file="$heartbeat_file"
-            activity_label="heartbeat"
-        else
-            activity_file="$bot_log"
-            activity_label="log update"
+            heartbeat_mtime="$(get_mtime_epoch "$heartbeat_file")"
+        fi
+        if [ -f "$bot_log" ]; then
+            bot_log_mtime="$(get_mtime_epoch "$bot_log")"
         fi
 
-        if [ ! -f "$activity_file" ]; then
-            echo "🔴 Bot status: unavailable (PID: $pid, activity file missing; common causes: startup did not complete, log/heartbeat path issue)"
-            exit 2
+        if [ -n "$heartbeat_mtime" ] && { [ -z "$bot_log_mtime" ] || [ "$heartbeat_mtime" -ge "$bot_log_mtime" ]; }; then
+            activity_file="$heartbeat_file"
+            activity_label="heartbeat"
+            mtime="$heartbeat_mtime"
+        elif [ -n "$bot_log_mtime" ]; then
+            activity_file="$bot_log"
+            activity_label="log update"
+            mtime="$bot_log_mtime"
         fi
 
         now="$(date +%s)"
-        mtime="$(get_mtime_epoch "$activity_file")"
-        if [ -z "$mtime" ] || [ "$mtime" -gt "$now" ]; then
-            echo "🔴 Bot status: unavailable (PID: $pid, invalid log timestamp; common causes: filesystem clock/mtime anomaly)"
-            exit 2
+        echo "🟢 Bot status: running"
+        print_component_status "Process" "alive" "PID: $pid"
+
+        if [ -n "$mtime" ] && [ "$mtime" -le "$now" ]; then
+            age_seconds=$((now - mtime))
+            if [ "$age_seconds" -ge "$inactive_after_seconds" ]; then
+                printf '   Activity: idle for %s (last %s %ss ago)\n' \
+                    "$(format_age_compact "$age_seconds")" \
+                    "$activity_label" \
+                    "$age_seconds"
+            else
+                print_component_status "Activity" "active" "last ${activity_label} ${age_seconds}s ago"
+            fi
+        elif [ -n "$mtime" ]; then
+            print_component_status "Activity" "unknown" "invalid timestamp on ${activity_label}"
+        else
+            print_component_status "Activity" "starting" "no heartbeat or bot.log yet"
         fi
 
-        age_seconds=$((now - mtime))
-        if [ "$age_seconds" -ge "$inactive_after_seconds" ]; then
-            age_minutes=$((age_seconds / 60))
-            echo "🔴 Bot status: unavailable (PID: $pid, inactive for ${age_minutes}m; common causes: proxy/network down, getUpdates conflict from another instance, worker hung)"
-            exit 2
+        telegram_line="$(get_last_log_match "$bot_log" 'Telegram API unreachable|Network error during initialization|Polling exited unexpectedly|Network down for')"
+        if [ -n "$telegram_line" ]; then
+            telegram_detail="$(extract_log_message "$telegram_line")"
+            telegram_age="$(log_line_age_seconds "$telegram_line" 2>/dev/null)"
+            if [ -n "$telegram_age" ] && [ "$telegram_age" -ge 0 ] 2>/dev/null; then
+                telegram_detail="last issue $(format_age_compact "$telegram_age") ago: $telegram_detail"
+            fi
+            print_component_status "Telegram" "degraded" "$telegram_detail"
+        else
+            print_component_status "Telegram" "healthy" ""
         fi
 
-        echo "🟢 Bot status: running (PID: $pid, last ${activity_label} ${age_seconds}s ago)"
+        claude_line="$(get_last_log_match "$bot_log" 'SDK returned error:')"
+        if [ -n "$claude_line" ]; then
+            claude_detail="$(extract_log_message "$claude_line")"
+            claude_age="$(log_line_age_seconds "$claude_line" 2>/dev/null)"
+            if [ -n "$claude_age" ] && [ "$claude_age" -ge 0 ] 2>/dev/null; then
+                claude_detail="last issue $(format_age_compact "$claude_age") ago: $claude_detail"
+            fi
+            if printf '%s' "$claude_line" | grep -Eq '403|upstream_error'; then
+                claude_detail="$claude_detail; session may still be resumable, you can retry"
+            fi
+            print_component_status "Claude" "degraded" "$claude_detail"
+        else
+            print_component_status "Claude" "healthy" ""
+        fi
     else
         echo "🔴 Bot status: unavailable (stale PID: $pid; common causes: process crashed/exited, stale pid file cleanup failed)"
         cleanup_pid
@@ -290,11 +381,27 @@ do_status() {
 
 do_stop() {
     local pid
+    local stopped_service=0
     pid="$(read_pid)"
+
+    if [ -f "$PLIST_FILE" ]; then
+        echo "🛑 Stopping launchd service: $PLIST_LABEL..."
+        launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || launchctl unload "$PLIST_FILE" 2>/dev/null || true
+        stopped_service=1
+        sleep 0.5
+    fi
+
     if [ -z "$pid" ]; then
-        echo "⚪ Bot is not running"
+        cleanup_pid
+        cleanup_token_lock
+        if [ "$stopped_service" -eq 1 ]; then
+            echo "✅ Bot stopped (launchd service stopped)"
+        else
+            echo "⚪ Bot is not running"
+        fi
         exit 0
     fi
+
     if kill -0 "$pid" 2>/dev/null; then
         echo "🛑 Stopping Bot (PID: $pid)..."
         kill "$pid"
@@ -308,11 +415,15 @@ do_stop() {
             kill -9 "$pid" 2>/dev/null
             sleep 0.5
         fi
-        cleanup_pid
-        echo "✅ Bot stopped"
     else
         echo "🔴 Process $pid no longer exists, cleaning up PID file"
-        cleanup_pid
+    fi
+    cleanup_pid
+    cleanup_token_lock
+    if [ "$stopped_service" -eq 1 ]; then
+        echo "✅ Bot stopped (launchd service stopped)"
+    else
+        echo "✅ Bot stopped"
     fi
     exit 0
 }
