@@ -592,6 +592,15 @@ class TelegramBot:
             return None
         return session_id
 
+    @staticmethod
+    def _message_timestamp_utc(message: Message) -> datetime:
+        message_date = getattr(message, "date", None)
+        if message_date is None:
+            return datetime.now(timezone.utc)
+        if message_date.tzinfo is None:
+            return message_date.replace(tzinfo=timezone.utc)
+        return message_date.astimezone(timezone.utc)
+
     def _setup_handlers(self):
         # Command handlers
         self.application.add_handler(CommandHandler("start", self._cmd_start))
@@ -1864,6 +1873,7 @@ class TelegramBot:
         current_reply_mode = self._normalize_reply_mode(
             current_session.get("reply_mode")
         )
+        message_timestamp = self._message_timestamp_utc(message)
         next_reply_mode = self._resolve_next_reply_mode(
             current_mode=current_reply_mode,
             message_source=message_source,
@@ -1883,8 +1893,17 @@ class TelegramBot:
 
         try:
             new_session = current_session.pop("new_session", False)
+            auto_new_session = await session_manager.should_start_new_session(
+                user_id, now=message_timestamp
+            )
+            if auto_new_session:
+                current_session["session_id"] = None
+                self._runtime_active_sessions.discard(user_id)
+                new_session = True
             if new_session:
                 await session_manager.update_session(user_id, current_session)
+
+            await session_manager.set_last_user_message_at(user_id, message_timestamp)
 
             enable_streaming_text = next_reply_mode != "voice"
             response = await project_chat_handler.process_message(

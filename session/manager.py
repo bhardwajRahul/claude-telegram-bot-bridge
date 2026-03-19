@@ -1,10 +1,14 @@
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
+
+from telegram_bot.utils.config import config
 from telegram_bot.session.store import session_store
 
 
 class SessionManager:
     VALID_REPLY_MODES = {"text", "voice"}
     DEFAULT_REPLY_MODE = "text"
+    LAST_USER_MESSAGE_AT_KEY = "last_user_message_at"
 
     def __init__(self):
         self.store = session_store
@@ -64,6 +68,56 @@ class SessionManager:
         if "pending_question" in session:
             del session["pending_question"]
             await self.update_session(user_id, session)
+
+    @staticmethod
+    def _normalize_timestamp(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _parse_timestamp(cls, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return cls._normalize_timestamp(parsed)
+
+    @staticmethod
+    def _auto_new_session_interval() -> Optional[timedelta]:
+        hours = getattr(config, "auto_new_session_after_hours", 24.0)
+        if hours is None:
+            return None
+        return timedelta(hours=float(hours))
+
+    async def get_last_user_message_at(self, user_id: int) -> Optional[datetime]:
+        session = await self.get_session(user_id)
+        return self._parse_timestamp(session.get(self.LAST_USER_MESSAGE_AT_KEY))
+
+    async def set_last_user_message_at(
+        self, user_id: int, at: Optional[datetime] = None
+    ) -> None:
+        timestamp = self._normalize_timestamp(at or datetime.now(timezone.utc))
+        await self.update_session(
+            user_id,
+            {self.LAST_USER_MESSAGE_AT_KEY: timestamp.isoformat()},
+        )
+
+    async def should_start_new_session(
+        self, user_id: int, now: Optional[datetime] = None
+    ) -> bool:
+        interval = self._auto_new_session_interval()
+        if interval is None:
+            return False
+
+        last_user_message_at = await self.get_last_user_message_at(user_id)
+        if last_user_message_at is None:
+            return False
+
+        current_time = self._normalize_timestamp(now or datetime.now(timezone.utc))
+        return current_time - last_user_message_at > interval
 
 
 session_manager = SessionManager()

@@ -78,6 +78,14 @@ class Config(BaseSettings):
         default=SESSION_STORE_PATH,
         description="Local session JSON storage path",
     )
+    auto_new_session_after_hours: Optional[float] = Field(
+        default=24.0,
+        description=(
+            "Automatically start a new Claude session when the gap since the "
+            "previous user message exceeds this many hours. Set to 0, false, "
+            "or off to disable."
+        ),
+    )
 
     # Access Control - comma-separated list of allowed user IDs (if empty, allow all)
     allowed_user_ids: List[int] = Field(
@@ -96,6 +104,43 @@ class Config(BaseSettings):
         if isinstance(v, int):
             return [v]
         return v
+
+    @field_validator("auto_new_session_after_hours", mode="before")
+    @classmethod
+    def parse_auto_new_session_after_hours(cls, v):
+        if v is None:
+            return 24.0
+        if isinstance(v, bool):
+            if not v:
+                return None
+            raise ValueError(
+                "AUTO_NEW_SESSION_AFTER_HOURS must be a positive number, "
+                "or 0/off/false to disable."
+            )
+        if isinstance(v, str):
+            value = v.strip().lower()
+            if not value:
+                return 24.0
+            if value in {"0", "false", "off", "no", "disable", "disabled"}:
+                return None
+            try:
+                parsed = float(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "AUTO_NEW_SESSION_AFTER_HOURS must be a positive number, "
+                    "or 0/off/false to disable."
+                ) from exc
+        else:
+            parsed = float(v)
+
+        if parsed == 0:
+            return None
+        if parsed < 0:
+            raise ValueError(
+                "AUTO_NEW_SESSION_AFTER_HOURS must be greater than 0, "
+                "or 0/off/false to disable."
+            )
+        return parsed
 
     # Streaming configuration
     draft_update_min_chars: int = Field(

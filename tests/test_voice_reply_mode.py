@@ -4,6 +4,7 @@
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -26,6 +27,7 @@ config_module.config = SimpleNamespace(
     voice_reply_persona="Tingting",
     draft_update_min_chars=20,
     draft_update_interval=0.1,
+    auto_new_session_after_hours=24.0,
 )
 sys.modules["telegram_bot.utils.config"] = config_module
 
@@ -53,6 +55,14 @@ class _SessionManager:
     async def clear_pending_question(self, user_id):
         del user_id
         return None
+
+    async def should_start_new_session(self, user_id, now=None):
+        del now
+        session = await self.get_session(user_id)
+        return bool(session.get("force_auto_new_session"))
+
+    async def set_last_user_message_at(self, user_id, at):
+        await self.update_session(user_id, {"last_user_message_at": at.isoformat()})
 
 
 session_module.session_manager = _SessionManager()
@@ -126,6 +136,7 @@ def _build_text_update(user_id: int, text: str):
     message = SimpleNamespace(
         text=text,
         message_id=1,
+        date=datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
         chat=SimpleNamespace(send_action=AsyncMock(), id=1001),
         reply_text=AsyncMock(),
     )
@@ -142,6 +153,7 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
         bot_module.config = config_module.config
         bot_module.session_manager = session_module.session_manager
         bot_module.project_chat_handler = project_chat_module.project_chat_handler
+        session_module.session_manager._sessions.clear()
 
     def test_voice_message_switches_to_voice_mode(self):
         bot = TelegramBot()
@@ -348,6 +360,60 @@ class VoiceReplyModeTests(unittest.IsolatedAsyncioTestCase):
 
         kwargs = process_mock.await_args.kwargs
         self.assertIsNone(kwargs["bot"])
+
+    async def test_expired_text_message_starts_new_session_automatically(self):
+        bot = TelegramBot()
+        bot.application = SimpleNamespace(bot=SimpleNamespace())
+        bot._save_session_id = AsyncMock()
+        bot._send_reply_by_mode = AsyncMock()
+        process_mock = AsyncMock(return_value=_ChatResponse(content="ok"))
+        project_chat_module.project_chat_handler.process_message = process_mock
+        bot_module.project_chat_handler.process_message = process_mock
+        await session_module.session_manager.update_session(
+            44,
+            {
+                "reply_mode": "text",
+                "session_id": "existing-session",
+                "force_auto_new_session": True,
+            },
+        )
+        bot._runtime_active_sessions.add(44)
+
+        update = _build_text_update(44, "隔天继续聊")
+        await bot._process_user_message_text(update, 44, "隔天继续聊")
+
+        kwargs = process_mock.await_args.kwargs
+        self.assertTrue(kwargs["new_session"])
+        self.assertIsNone(kwargs["session_id"])
+        session = await session_module.session_manager.get_session(44)
+        self.assertIn("last_user_message_at", session)
+
+    async def test_expired_voice_message_starts_new_session_automatically(self):
+        bot = TelegramBot()
+        bot.application = SimpleNamespace(bot=SimpleNamespace())
+        bot._save_session_id = AsyncMock()
+        bot._send_reply_by_mode = AsyncMock()
+        process_mock = AsyncMock(return_value=_ChatResponse(content="ok"))
+        project_chat_module.project_chat_handler.process_message = process_mock
+        bot_module.project_chat_handler.process_message = process_mock
+        await session_module.session_manager.update_session(
+            55,
+            {
+                "reply_mode": "voice",
+                "session_id": "voice-session",
+                "force_auto_new_session": True,
+            },
+        )
+        bot._runtime_active_sessions.add(55)
+
+        update = _build_text_update(55, "来自语音")
+        await bot._process_user_message_text(
+            update, 55, "来自语音", message_source="voice"
+        )
+
+        kwargs = process_mock.await_args.kwargs
+        self.assertTrue(kwargs["new_session"])
+        self.assertIsNone(kwargs["session_id"])
 
 
 if __name__ == "__main__":

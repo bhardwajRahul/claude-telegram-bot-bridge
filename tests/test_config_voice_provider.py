@@ -138,6 +138,32 @@ class VoiceProviderConfigTests(unittest.TestCase):
             cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
             self.assertEqual(cfg.voice_reply_persona, "Tingting")
 
+    def test_auto_new_session_hours_defaults_to_24(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(telegram_bot_token="123456:abc", _env_file=None)
+            self.assertEqual(cfg.auto_new_session_after_hours, 24.0)
+
+    def test_auto_new_session_hours_can_be_disabled(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(
+                telegram_bot_token="123456:abc",
+                auto_new_session_after_hours="off",
+                _env_file=None,
+            )
+            self.assertIsNone(cfg.auto_new_session_after_hours)
+
+    def test_auto_new_session_hours_accepts_custom_number(self):
+        with TemporaryDirectory() as td:
+            module = self._load_config_module(td)
+            cfg = module.Config(
+                telegram_bot_token="123456:abc",
+                auto_new_session_after_hours="12",
+                _env_file=None,
+            )
+            self.assertEqual(cfg.auto_new_session_after_hours, 12.0)
+
 
 if __name__ == "__main__":
     unittest.main()
