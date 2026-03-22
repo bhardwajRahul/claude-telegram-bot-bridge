@@ -6,6 +6,8 @@ import platform
 import re
 import shlex
 import signal
+import shutil
+import subprocess
 import time
 from pathlib import Path as FilePath
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -52,6 +54,7 @@ from telegram_bot.utils.transcription import (
 )
 from telegram_bot.utils.tts import MacOSTtsSynthesizer, VoicePersonaNotAvailableError
 from telegram_bot.utils.tos_uploader import TOSUploadError, VolcengineTOSUploader
+from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
@@ -166,13 +169,59 @@ class TelegramBot:
 
     def run(self):
         """Run the bot with in-process polling restart capability."""
+        exit_reason = "Bot stopped"
         try:
+            health_reporter.initialize_process()
+            health_reporter.mark_starting("initializing bot")
             asyncio.run(self._run_async())
-        except (KeyboardInterrupt, SystemExit):
+        except KeyboardInterrupt:
+            exit_reason = "Stopped by signal"
+            raise
+        except SystemExit as exc:
+            if exc.code not in (None, 0):
+                exit_reason = str(exc.code)
             raise
         except Exception:
+            exit_reason = "Unexpected error in bot run loop"
             logger.exception("Unexpected error in bot run loop")
             raise
+        finally:
+            health_reporter.mark_unavailable(exit_reason)
+            health_reporter.cleanup_runtime_files()
+
+    def _probe_claude_readiness(self) -> tuple[bool, str]:
+        cli_path = (
+            str(config.claude_cli_path)
+            if config.claude_cli_path
+            else shutil.which("claude") or ""
+        )
+        if not cli_path:
+            return False, "claude command not found"
+
+        try:
+            proc = subprocess.run(
+                [cli_path, "auth", "status", "--json"],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "claude auth status timed out"
+        except Exception as exc:
+            return False, f"claude auth status failed: {exc}"
+
+        raw = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            preview = raw.replace("\n", " ")[:200]
+            return False, f"invalid claude auth response: {preview}"
+
+        if data.get("loggedIn") is True:
+            return True, ""
+
+        return False, "claude authentication unavailable"
 
     async def _run_async(self):
         """Async entry: manage Application lifecycle and polling restart loop."""
@@ -190,21 +239,30 @@ class TelegramBot:
 
             logger.info("Starting...")
             start_time = time.time()
+            health_reporter.mark_starting("initializing telegram polling")
 
             try:
                 await self.application.initialize()
             except telegram.error.InvalidToken:
-                raise SystemExit(
+                message = (
                     "Invalid Telegram Bot Token. "
                     "Please check TELEGRAM_BOT_TOKEN in your .env file.\n"
                     "   Get a valid token from @BotFather on Telegram."
                 )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                raise SystemExit(message)
             except telegram.error.Conflict:
-                raise SystemExit(
+                message = (
                     "Another bot instance is already running with the same token.\n"
                     "   Use --stop to stop it first, or check for duplicate processes."
                 )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                raise SystemExit(message)
             except telegram.error.NetworkError as e:
+                health_reporter.record_telegram_error(
+                    f"telegram startup error: {e}",
+                    consecutive_failures=1,
+                )
                 logger.warning(
                     "Network error during initialization: %s, retrying...", e
                 )
@@ -222,12 +280,21 @@ class TelegramBot:
                 )
 
                 logger.info("Bot is running")
+                health_reporter.record_telegram_ok()
+                claude_ready, claude_reason = self._probe_claude_readiness()
+                if claude_ready:
+                    health_reporter.record_claude_ok()
+                else:
+                    health_reporter.record_claude_error(claude_reason)
 
                 watchdog_task = asyncio.create_task(self._polling_watchdog(stop_event))
 
                 await self._wait_for_polling_exit(stop_event)
 
             except _PollingRestart:
+                health_reporter.mark_starting(
+                    "restarting polling after connection loss"
+                )
                 uptime = time.time() - start_time
                 if uptime < self._MIN_UPTIME:
                     rapid_crash_count += 1
@@ -248,13 +315,19 @@ class TelegramBot:
                 logger.warning("Polling restart triggered, restarting...")
                 continue
             except telegram.error.NetworkError as e:
+                health_reporter.record_telegram_error(
+                    f"telegram runtime error: {e}",
+                    consecutive_failures=1,
+                )
                 logger.warning("Network error during startup: %s", e)
                 continue
             except telegram.error.Forbidden as e:
-                raise SystemExit(
+                message = (
                     f"Bot token was revoked or bot is blocked: {e}\n"
                     "   Create a new token via @BotFather on Telegram."
                 )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                raise SystemExit(message)
             finally:
                 if watchdog_task and not watchdog_task.done():
                     watchdog_task.cancel()
@@ -285,9 +358,13 @@ class TelegramBot:
                         consecutive_failures,
                     )
                 consecutive_failures = 0
+                health_reporter.record_telegram_ok()
             except Exception as e:
                 consecutive_failures += 1
                 total_down = consecutive_failures * self._WATCHDOG_INTERVAL
+                health_reporter.record_telegram_error(
+                    str(e), consecutive_failures=consecutive_failures
+                )
                 logger.warning("Telegram API unreachable (%ds): %s", total_down, e)
 
                 if total_down >= self._NETWORK_FAILURE_THRESHOLD:

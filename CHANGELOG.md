@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-03-22
+
+### Fixed
+- Persist structured runtime health to `.telegram_bot/health.json` so `start.sh --status` reports live `starting`, `available`, `degraded`, and `unavailable` states instead of relying on stale logs
+- Probe Claude CLI authentication during startup and request handling so status output can distinguish Telegram transport issues from Claude availability issues
+- Stop the daemon supervisor before the bot process during `start.sh --stop`, and keep shared token lock files intact when the current bot is not the owner
+
+### Changed
+- Expanded health and status regression coverage for runtime cleanup, stale health detection, supervisor shutdown, and component-specific degraded reporting
+
 ## [0.9.0] - 2026-03-20
 
 ### Added

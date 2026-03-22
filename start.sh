@@ -108,6 +108,10 @@ fi
 
 ACTION="run"
 DAEMON_MODE=0  # Default to foreground mode
+PROCESS_MODE="foreground"
+RUN_AS_DAEMON_SUPERVISOR=0
+INTERNAL_RUN=0
+WATCHDOG_INTERVAL=60
 
 # Show help when no arguments are given
 if [ $# -eq 0 ]; then
@@ -150,9 +154,16 @@ while [ $# -gt 0 ]; do
             ACTION="upgrade"
             shift
             ;;
-        --_daemon_child)
-            # Internal flag: marks current process as daemon child, run in foreground
+        --_daemon_supervisor)
+            PROCESS_MODE="daemon"
+            RUN_AS_DAEMON_SUPERVISOR=1
+            INTERNAL_RUN=1
             DAEMON_MODE=0
+            shift
+            ;;
+        --_launchd_child)
+            PROCESS_MODE="launchd"
+            INTERNAL_RUN=1
             shift
             ;;
         -h|--help)
@@ -206,6 +217,9 @@ echo "📂 Project path: $PROJECT_ROOT"
 BOT_DATA_DIR="$PROJECT_ROOT/.telegram_bot"
 LOGS_DIR="$BOT_DATA_DIR/logs"
 PID_FILE="$BOT_DATA_DIR/bot.pid"
+SUPERVISOR_PID_FILE="$BOT_DATA_DIR/supervisor.pid"
+HEALTH_FILE="$BOT_DATA_DIR/health.json"
+HEALTH_STALE_SECONDS=$((WATCHDOG_INTERVAL * 2 + 30))
 ENV_FILE="$BOT_DATA_DIR/.env"
 ENV_EXAMPLE_FILE="$SCRIPT_DIR/.env.example"
 PROJECT_SLUG="$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
@@ -219,9 +233,19 @@ read_pid() {
     [ -f "$PID_FILE" ] && cat "$PID_FILE"
 }
 
+read_supervisor_pid() {
+    [ -f "$SUPERVISOR_PID_FILE" ] && cat "$SUPERVISOR_PID_FILE"
+}
+
 is_running() {
     local pid
     pid="$(read_pid)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+is_supervisor_running() {
+    local pid
+    pid="$(read_supervisor_pid)"
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
@@ -229,54 +253,8 @@ cleanup_pid() {
     rm -f "$PID_FILE" 2>/dev/null || true
 }
 
-get_mtime_epoch() {
-    local file="$1"
-    if [ ! -e "$file" ]; then
-        return 1
-    fi
-    stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null
-}
-
-format_age_compact() {
-    local age_seconds="$1"
-    if [ "$age_seconds" -ge 3600 ]; then
-        printf '%sh' $((age_seconds / 3600))
-    elif [ "$age_seconds" -ge 60 ]; then
-        printf '%sm' $((age_seconds / 60))
-    else
-        printf '%ss' "$age_seconds"
-    fi
-}
-
-extract_log_message() {
-    local line="$1"
-    printf '%s\n' "$line" | sed -E 's/^[0-9-]+ [0-9:,]+ - [^-]+ - [A-Z]+ - //'
-}
-
-get_last_log_match() {
-    local file="$1"
-    local pattern="$2"
-    [ -f "$file" ] || return 1
-    grep -E "$pattern" "$file" | tail -n 1
-}
-
-log_line_age_seconds() {
-    local line="$1"
-    [ -n "$line" ] || return 1
-    python3 - "$line" <<'PY'
-import sys
-from datetime import datetime
-
-line = sys.argv[1]
-prefix = " - ".join(line.split(" - ")[:3])
-try:
-    ts = prefix.split(" - ", 1)[0]
-    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S,%f")
-except Exception:
-    sys.exit(1)
-
-print(int((datetime.now() - dt).total_seconds()))
-PY
+cleanup_supervisor_pid() {
+    rm -f "$SUPERVISOR_PID_FILE" 2>/dev/null || true
 }
 
 print_component_status() {
@@ -290,140 +268,174 @@ print_component_status() {
     printf '\n'
 }
 
+render_status_from_health() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+health_path = Path(sys.argv[1])
+pid = sys.argv[2]
+stale_seconds = int(sys.argv[3])
+
+
+def parse_iso(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_age(seconds: int) -> str:
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def line(component: str, state: str, detail: str = "") -> str:
+    if detail:
+        return f"   {component}: {state} ({detail})"
+    return f"   {component}: {state}"
+
+
+if not health_path.exists():
+    print("🟡 Bot status: degraded")
+    print(line("Process", "alive", f"PID: {pid}"))
+    print(line("Service", "degraded", "health missing"))
+    print(line("Telegram", "degraded", "health missing"))
+    print(line("Claude", "degraded", "health missing"))
+    raise SystemExit(0)
+
+try:
+    data = json.loads(health_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print("🟡 Bot status: degraded")
+    print(line("Process", "alive", f"PID: {pid}"))
+    print(line("Service", "degraded", f"invalid health file: {exc}"))
+    print(line("Telegram", "degraded", "health unreadable"))
+    print(line("Claude", "degraded", "health unreadable"))
+    raise SystemExit(0)
+
+updated_at = parse_iso(data.get("updated_at"))
+age_seconds = None
+if updated_at is not None:
+    age_seconds = max(0, int((datetime.now(timezone.utc) - updated_at).total_seconds()))
+
+service = data.get("service") or {}
+telegram = data.get("telegram") or {}
+claude = data.get("claude") or {}
+
+if age_seconds is None or age_seconds > stale_seconds:
+    detail = "health stale"
+    if age_seconds is not None:
+        detail = f"health stale: last update {format_age(age_seconds)} ago"
+    print("🟡 Bot status: degraded")
+    print(line("Process", "alive", f"PID: {pid}"))
+    print(line("Service", "degraded", detail))
+    print(line("Telegram", "degraded", detail))
+    print(line("Claude", "degraded", detail))
+    raise SystemExit(0)
+
+service_state = service.get("state") or "degraded"
+service_reason = service.get("reason") or ""
+telegram_state = telegram.get("state") or "degraded"
+telegram_reason = telegram.get("last_error") or ""
+claude_state = claude.get("state") or "degraded"
+claude_reason = claude.get("last_error") or ""
+
+icons = {
+    "available": "🟢",
+    "starting": "🟡",
+    "degraded": "🟡",
+    "unavailable": "🔴",
+}
+print(f"{icons.get(service_state, '🟡')} Bot status: {service_state}")
+print(line("Process", "alive", f"PID: {pid}"))
+print(line("Service", service_state, service_reason))
+print(line("Telegram", telegram_state, telegram_reason if telegram_state != "healthy" else ""))
+print(line("Claude", claude_state, claude_reason if claude_state != "healthy" else ""))
+PY
+}
+
 # ── Action handlers ──
 
 do_status() {
     local pid
     pid="$(read_pid)"
     if [ -z "$pid" ]; then
-        echo "🔴 Bot status: unavailable (no PID file; common causes: process exited/crashed, service not started)"
+        echo "🔴 Bot status: unavailable"
+        print_component_status "Process" "dead" "no PID file"
+        print_component_status "Service" "unavailable" "process not running"
+        print_component_status "Telegram" "unavailable" "process not running"
+        print_component_status "Claude" "unavailable" "process not running"
         exit 0
     fi
     if kill -0 "$pid" 2>/dev/null; then
-        local heartbeat_file="$BOT_DATA_DIR/bot.heartbeat"
-        local bot_log="$LOGS_DIR/bot.log"
-        local activity_file activity_label
-        local now mtime age_seconds
-        local heartbeat_mtime="" bot_log_mtime=""
-        local inactive_after_seconds="${STATUS_INACTIVE_SECONDS:-900}"
-        local telegram_line telegram_age telegram_detail
-        local claude_line claude_age claude_detail
-
-        if [ -f "$heartbeat_file" ]; then
-            heartbeat_mtime="$(get_mtime_epoch "$heartbeat_file")"
-        fi
-        if [ -f "$bot_log" ]; then
-            bot_log_mtime="$(get_mtime_epoch "$bot_log")"
-        fi
-
-        if [ -n "$heartbeat_mtime" ] && { [ -z "$bot_log_mtime" ] || [ "$heartbeat_mtime" -ge "$bot_log_mtime" ]; }; then
-            activity_file="$heartbeat_file"
-            activity_label="heartbeat"
-            mtime="$heartbeat_mtime"
-        elif [ -n "$bot_log_mtime" ]; then
-            activity_file="$bot_log"
-            activity_label="log update"
-            mtime="$bot_log_mtime"
-        fi
-
-        now="$(date +%s)"
-        echo "🟢 Bot status: running"
-        print_component_status "Process" "alive" "PID: $pid"
-
-        if [ -n "$mtime" ] && [ "$mtime" -le "$now" ]; then
-            age_seconds=$((now - mtime))
-            if [ "$age_seconds" -ge "$inactive_after_seconds" ]; then
-                printf '   Activity: idle for %s (last %s %ss ago)\n' \
-                    "$(format_age_compact "$age_seconds")" \
-                    "$activity_label" \
-                    "$age_seconds"
-            else
-                print_component_status "Activity" "active" "last ${activity_label} ${age_seconds}s ago"
-            fi
-        elif [ -n "$mtime" ]; then
-            print_component_status "Activity" "unknown" "invalid timestamp on ${activity_label}"
-        else
-            print_component_status "Activity" "starting" "no heartbeat or bot.log yet"
-        fi
-
-        telegram_line="$(get_last_log_match "$bot_log" 'Telegram API unreachable|Network error during initialization|Polling exited unexpectedly|Network down for')"
-        if [ -n "$telegram_line" ]; then
-            telegram_detail="$(extract_log_message "$telegram_line")"
-            telegram_age="$(log_line_age_seconds "$telegram_line" 2>/dev/null)"
-            if [ -n "$telegram_age" ] && [ "$telegram_age" -ge 0 ] 2>/dev/null; then
-                telegram_detail="last issue $(format_age_compact "$telegram_age") ago: $telegram_detail"
-            fi
-            print_component_status "Telegram" "degraded" "$telegram_detail"
-        else
-            print_component_status "Telegram" "healthy" ""
-        fi
-
-        claude_line="$(get_last_log_match "$bot_log" 'SDK returned error:')"
-        if [ -n "$claude_line" ]; then
-            claude_detail="$(extract_log_message "$claude_line")"
-            claude_age="$(log_line_age_seconds "$claude_line" 2>/dev/null)"
-            if [ -n "$claude_age" ] && [ "$claude_age" -ge 0 ] 2>/dev/null; then
-                claude_detail="last issue $(format_age_compact "$claude_age") ago: $claude_detail"
-            fi
-            if printf '%s' "$claude_line" | grep -Eq '403|upstream_error'; then
-                claude_detail="$claude_detail; session may still be resumable, you can retry"
-            fi
-            print_component_status "Claude" "degraded" "$claude_detail"
-        else
-            print_component_status "Claude" "healthy" ""
-        fi
+        render_status_from_health "$HEALTH_FILE" "$pid" "$HEALTH_STALE_SECONDS"
     else
-        echo "🔴 Bot status: unavailable (stale PID: $pid; common causes: process crashed/exited, stale pid file cleanup failed)"
+        echo "🔴 Bot status: unavailable"
+        print_component_status "Process" "dead" "stale PID: $pid"
+        print_component_status "Service" "unavailable" "process not running"
+        print_component_status "Telegram" "unavailable" "process not running"
+        print_component_status "Claude" "unavailable" "process not running"
         cleanup_pid
     fi
     exit 0
 }
 
 do_stop() {
-    local pid
+    local pid supervisor_pid
     local stopped_service=0
+    supervisor_pid="$(read_supervisor_pid)"
     pid="$(read_pid)"
 
     if [ -f "$PLIST_FILE" ]; then
         echo "🛑 Stopping launchd service: $PLIST_LABEL..."
         launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || launchctl unload "$PLIST_FILE" 2>/dev/null || true
         stopped_service=1
-        sleep 0.5
+        sleep 1
     fi
 
-    if [ -z "$pid" ]; then
-        cleanup_pid
-        cleanup_token_lock
-        if [ "$stopped_service" -eq 1 ]; then
-            echo "✅ Bot stopped (launchd service stopped)"
-        else
-            echo "⚪ Bot is not running"
+    if [ -n "$supervisor_pid" ] && kill -0 "$supervisor_pid" 2>/dev/null; then
+        echo "🛑 Stopping daemon supervisor (PID: $supervisor_pid)..."
+        kill "$supervisor_pid"
+        for i in $(seq 1 10); do
+            kill -0 "$supervisor_pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$supervisor_pid" 2>/dev/null; then
+            echo "⚠️  Supervisor not responding to SIGTERM, sending SIGKILL..."
+            kill -9 "$supervisor_pid" 2>/dev/null
+            sleep 0.5
         fi
-        exit 0
     fi
 
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "🛑 Stopping Bot (PID: $pid)..."
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "🛑 Stopping bot process (PID: $pid)..."
         kill "$pid"
-        # Wait for process to exit, max 10 seconds
         for i in $(seq 1 10); do
             kill -0 "$pid" 2>/dev/null || break
             sleep 1
         done
         if kill -0 "$pid" 2>/dev/null; then
-            echo "⚠️  Process not responding to SIGTERM, sending SIGKILL..."
+            echo "⚠️  Bot process not responding to SIGTERM, sending SIGKILL..."
             kill -9 "$pid" 2>/dev/null
             sleep 0.5
         fi
-    else
-        echo "🔴 Process $pid no longer exists, cleaning up PID file"
     fi
+
     cleanup_pid
-    cleanup_token_lock
-    if [ "$stopped_service" -eq 1 ]; then
-        echo "✅ Bot stopped (launchd service stopped)"
-    else
+    cleanup_supervisor_pid
+    cleanup_token_lock_if_safe "$supervisor_pid" "$pid"
+    if [ "$stopped_service" -eq 1 ] || [ -n "$supervisor_pid" ] || [ -n "$pid" ]; then
         echo "✅ Bot stopped"
+    else
+        echo "⚪ Bot is not running"
     fi
     exit 0
 }
@@ -433,13 +445,17 @@ read_env_value() {
     local file="${2:-$ENV_FILE}"
     [ -f "$file" ] || return 0
     local line
-    line="$(grep -E "^${key}=" "$file" | tail -n1)"
+    line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" | tail -n1)"
     [ -n "$line" ] || return 0
     local value="${line#*=}"
+    value="$(printf '%s' "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     value="${value%\"}"
     value="${value#\"}"
     value="${value%\'}"
     value="${value#\'}"
+    # Strip trailing inline comment (common pattern: KEY=value # comment)
+    value="${value%% \#*}"
+    value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+$//')"
     echo "$value"
 }
 
@@ -484,6 +500,9 @@ read_env_with_fallback() {
     local key="$1"
     local value
     value="$(read_env_value "$key")"
+    if [ "$key" = "TELEGRAM_BOT_TOKEN" ] && ! _is_valid_token "$value"; then
+        value=""
+    fi
     if [ -z "$value" ]; then
         value="$(read_env_value "$key" "$SCRIPT_DIR/.env")"
     fi
@@ -548,9 +567,10 @@ check_env() {
 
 do_install() {
     check_env
+    init_token_lock
     # Refuse if an instance is already running (any startup mode)
-    if is_running; then
-        echo "⚠️  Bot is already running in background (PID: $(read_pid)). Use --stop first."
+    if is_running || is_supervisor_running; then
+        echo "⚠️  Bot is already running. Use --stop first."
         exit 1
     fi
     if is_token_locked; then
@@ -573,7 +593,7 @@ do_install() {
         <string>${SCRIPT_DIR}/start.sh</string>
         <string>--path</string>
         <string>${PROJECT_ROOT}</string>
-        <string>--_daemon_child</string>
+        <string>--_launchd_child</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -616,6 +636,7 @@ do_uninstall() {
         launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || launchctl unload "$PLIST_FILE" 2>/dev/null
         rm -f "$PLIST_FILE"
         cleanup_pid
+        cleanup_supervisor_pid
         echo "✅ Startup service uninstalled"
     else
         echo "⚪ Startup service not installed (plist not found)"
@@ -664,22 +685,68 @@ do_upgrade() {
 }
 
 # ── Token-based global lock (prevents duplicate instances across different project dirs) ──
-_raw_token="$(read_env_with_fallback "TELEGRAM_BOT_TOKEN")"
-_token_hash="$(printf '%s' "$_raw_token" | md5 -q 2>/dev/null || printf '%s' "$_raw_token" | md5sum | cut -d' ' -f1)"
-TOKEN_LOCK_DIR="$HOME/.telegram-bot-locks"
-TOKEN_LOCK_FILE="$TOKEN_LOCK_DIR/${_token_hash}.pid"
-mkdir -p "$TOKEN_LOCK_DIR"
-unset _raw_token _token_hash
+TOKEN_LOCK_FILE=""
+
+init_token_lock() {
+    if [ -n "$TOKEN_LOCK_FILE" ]; then
+        return 0
+    fi
+    local raw_token token_hash
+    raw_token="$(read_env_with_fallback "TELEGRAM_BOT_TOKEN")"
+    token_hash="$(printf '%s' "$raw_token" | md5 -q 2>/dev/null || printf '%s' "$raw_token" | md5sum | cut -d' ' -f1)"
+    TOKEN_LOCK_DIR="$HOME/.telegram-bot-locks"
+    TOKEN_LOCK_FILE="$TOKEN_LOCK_DIR/${token_hash}.pid"
+    mkdir -p "$TOKEN_LOCK_DIR"
+}
 
 is_token_locked() {
+    init_token_lock
     [ -f "$TOKEN_LOCK_FILE" ] || return 1
     local lock_pid
     lock_pid="$(cat "$TOKEN_LOCK_FILE")"
     [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null
 }
 
+write_token_lock() {
+    init_token_lock
+    printf '%s\n' "$1" > "$TOKEN_LOCK_FILE"
+}
+
 cleanup_token_lock() {
-    rm -f "$TOKEN_LOCK_FILE"
+    if [ -z "$TOKEN_LOCK_FILE" ]; then
+        init_token_lock
+    fi
+    [ -n "$TOKEN_LOCK_FILE" ] && rm -f "$TOKEN_LOCK_FILE"
+}
+
+cleanup_token_lock_if_safe() {
+    local expected_pid_1="$1"
+    local expected_pid_2="$2"
+    local lock_pid
+
+    if [ -z "$TOKEN_LOCK_FILE" ]; then
+        init_token_lock
+    fi
+    [ -n "$TOKEN_LOCK_FILE" ] || return 0
+    [ -f "$TOKEN_LOCK_FILE" ] || return 0
+
+    lock_pid="$(cat "$TOKEN_LOCK_FILE" 2>/dev/null)"
+    if [ -z "$lock_pid" ]; then
+        cleanup_token_lock
+        return 0
+    fi
+
+    if [ -n "$expected_pid_1" ] && [ "$lock_pid" = "$expected_pid_1" ]; then
+        cleanup_token_lock
+        return 0
+    fi
+    if [ -n "$expected_pid_2" ] && [ "$lock_pid" = "$expected_pid_2" ]; then
+        cleanup_token_lock
+        return 0
+    fi
+    if ! kill -0 "$lock_pid" 2>/dev/null; then
+        cleanup_token_lock
+    fi
 }
 
 # ── Dispatch action ──
@@ -694,7 +761,7 @@ case "$ACTION" in
 esac
 
 # Check for updates (skip if running upgrade action)
-[ "$ACTION" = "run" ] && check_update
+[ "$ACTION" = "run" ] && [ "$INTERNAL_RUN" -eq 0 ] && check_update
 
 load_optional_env() {
     local env_cli
@@ -727,14 +794,131 @@ maybe_setup_claude_cli() {
         exit 1
     fi
 }
+
+prepare_runtime() {
+    load_optional_env
+    maybe_setup_claude_cli
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "❌ Error: Python 3.11+ is required"
+        exit 1
+    fi
+
+    ensure_venv
+    sync_dependencies 0
+
+    echo "✅ Activating virtual environment"
+    . "$VENV_DIR/bin/activate"
+
+    CLEANUP_MARKER="$BOT_DATA_DIR/.last_cleanup"
+    if [ -d "$LOGS_DIR" ]; then
+        if [ ! -f "$CLEANUP_MARKER" ] || [ -n "$(find "$CLEANUP_MARKER" -mtime +1 2>/dev/null)" ]; then
+            echo -e "\033[90m🧹 Cleaning up logs older than 14 days...\033[0m"
+            find "$LOGS_DIR" -name "*.log" -mtime +14 -delete 2>/dev/null
+            touch "$CLEANUP_MARKER"
+        fi
+    fi
+
+    cd "$REPO_ROOT"
+}
+
+exec_bot_once() {
+    export BOT_PROCESS_MODE="$PROCESS_MODE"
+    export BOT_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE"
+    export BOT_OWNS_TOKEN_LOCK="1"
+    write_token_lock "$$"
+
+    echo ""
+    echo "🚀 Starting Telegram Bot..."
+    echo "================================"
+
+    if [ -n "$BOT_DEBUG" ]; then
+        exec "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" --debug
+    fi
+    exec "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT"
+}
+
+run_daemon_supervisor() {
+    MAX_RAPID_CRASHES=5
+    RAPID_CRASH_WINDOW=60
+    RESTART_DELAY_BASE=3
+    rapid_crash_count=0
+    child_pid=""
+
+    daemon_cleanup() {
+        if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
+            kill "$child_pid" 2>/dev/null || true
+            wait "$child_pid" 2>/dev/null || true
+        fi
+        cleanup_supervisor_pid
+        cleanup_token_lock
+    }
+
+    trap daemon_cleanup EXIT
+    trap 'exit 143' TERM INT
+
+    echo $$ > "$SUPERVISOR_PID_FILE"
+    write_token_lock "$$"
+
+    while true; do
+        echo ""
+        echo "🚀 Starting Telegram Bot..."
+        echo "================================"
+
+        start_time=$(date +%s)
+        if [ -n "$BOT_DEBUG" ]; then
+            BOT_PROCESS_MODE=daemon BOT_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE" BOT_OWNS_TOKEN_LOCK=0 \
+                "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" --debug &
+        else
+            BOT_PROCESS_MODE=daemon BOT_TOKEN_LOCK_FILE="$TOKEN_LOCK_FILE" BOT_OWNS_TOKEN_LOCK=0 \
+                "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" &
+        fi
+        child_pid=$!
+        wait "$child_pid"
+        exit_code=$?
+        child_pid=""
+        end_time=$(date +%s)
+
+        if [ "$exit_code" -eq 0 ]; then
+            echo "✅ Bot exited normally"
+            break
+        fi
+
+        crash_log="$LOGS_DIR/crash_$(date +%Y%m%d_%H%M%S).log"
+        {
+            echo "=== Bot crashed ==="
+            echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "Exit code: $exit_code"
+            echo "Uptime: $((end_time - start_time)) seconds"
+        } > "$crash_log"
+        echo "❌ Bot crashed (exit code: $exit_code), log written to: $crash_log"
+
+        if [ $((end_time - start_time)) -lt $RAPID_CRASH_WINDOW ]; then
+            rapid_crash_count=$((rapid_crash_count + 1))
+            echo "⚠️  Rapid crash ($rapid_crash_count/$MAX_RAPID_CRASHES)"
+            if [ "$rapid_crash_count" -ge "$MAX_RAPID_CRASHES" ]; then
+                echo "🛑 Rapid crash limit reached ($MAX_RAPID_CRASHES times), stopping restart"
+                exit 1
+            fi
+        else
+            rapid_crash_count=0
+        fi
+
+        restart_delay=$((RESTART_DELAY_BASE * (rapid_crash_count + 1)))
+        if [ "$restart_delay" -gt 30 ]; then
+            restart_delay=30
+        fi
+        echo "🔄 Auto-restarting in ${restart_delay} seconds..."
+        sleep "$restart_delay"
+    done
+}
+
 check_env
+init_token_lock
 
-# ── Daemon mode handling ──
-
-if [ "$DAEMON_MODE" -eq 1 ]; then
-    # Check if an instance is already running
-    if is_running; then
-        echo "⚠️  Bot is already running in background (PID: $(read_pid)). Use --stop first to restart."
+if [ "$DAEMON_MODE" -eq 1 ] && [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 0 ]; then
+    if is_supervisor_running || is_running; then
+        echo "⚠️  Bot is already running. Use --stop first to restart."
         exit 1
     fi
     if is_token_locked; then
@@ -743,112 +927,28 @@ if [ "$DAEMON_MODE" -eq 1 ]; then
     fi
 
     echo "🌙 Starting in daemon mode..."
-    DAEMON_LOG="$LOGS_DIR/bot_stdout.log"
-
-    # Build child process arguments (remove --daemon, add --_daemon_child)
-    CHILD_ARGS=("--path" "$PROJECT_ROOT" "--_daemon_child")
-    [ -n "$BOT_DEBUG" ] && CHILD_ARGS+=("--debug")
-
-    nohup "$SCRIPT_DIR/start.sh" "${CHILD_ARGS[@]}" >> "$DAEMON_LOG" 2>&1 &
-    CHILD_PID=$!
-    echo "$CHILD_PID" > "$PID_FILE"
-    echo "✅ Bot started in background (PID: $CHILD_PID)"
+    DAEMON_LOG="$LOGS_DIR/supervisor.log"
+    SUPERVISOR_ARGS=("--path" "$PROJECT_ROOT" "--_daemon_supervisor")
+    [ -n "$BOT_DEBUG" ] && SUPERVISOR_ARGS+=("--debug")
+    nohup "$SCRIPT_DIR/start.sh" "${SUPERVISOR_ARGS[@]}" >> "$DAEMON_LOG" 2>&1 &
+    SUPERVISOR_PID=$!
+    echo "✅ Bot started in background (PID: $SUPERVISOR_PID)"
     echo "📄 Log: $DAEMON_LOG"
+    echo "💡 Use $0 --path \"$PROJECT_ROOT\" --status to check status"
     echo "💡 Use $0 --path \"$PROJECT_ROOT\" --stop to stop"
     exit 0
 fi
 
-# Foreground mode (including --_daemon_child): write PID early and register cleanup
-BOT_PID=""
-on_exit() {
-    [ -n "$BOT_PID" ] && kill "$BOT_PID" 2>/dev/null && wait "$BOT_PID" 2>/dev/null
-    cleanup_pid
-    cleanup_token_lock
-}
-trap on_exit EXIT
-trap 'exit 143' TERM INT
+if [ "$RUN_AS_DAEMON_SUPERVISOR" -eq 1 ]; then
+    prepare_runtime
+    run_daemon_supervisor
+    exit $?
+fi
+
 if is_token_locked; then
     echo "⚠️  Another instance is already using the same Bot Token (PID: $(cat "$TOKEN_LOCK_FILE")). Stop it first."
     exit 1
 fi
-echo $$ > "$PID_FILE"
-echo $$ > "$TOKEN_LOCK_FILE"
 
-load_optional_env
-maybe_setup_claude_cli
-
-# Check Python
-if ! command -v python3 &> /dev/null; then
-    echo "❌ Error: Python 3.11+ is required"
-    exit 1
-fi
-
-ensure_venv
-sync_dependencies 0
-
-# Activate virtual environment
-echo "✅ Activating virtual environment"
-source "$VENV_DIR/bin/activate"
-
-# Clean up logs older than 14 days (at most once per day)
-CLEANUP_MARKER="$BOT_DATA_DIR/.last_cleanup"
-if [ -d "$LOGS_DIR" ]; then
-    if [ ! -f "$CLEANUP_MARKER" ] || [ -n "$(find "$CLEANUP_MARKER" -mtime +1 2>/dev/null)" ]; then
-        echo -e "\033[90m🧹 Cleaning up logs older than 14 days...\033[0m"
-        find "$LOGS_DIR" -name "*.log" -mtime +14 -delete 2>/dev/null
-        touch "$CLEANUP_MARKER"
-    fi
-fi
-
-# Start Bot (auto-restart on crash)
-MAX_RAPID_CRASHES=5
-RAPID_CRASH_WINDOW=60
-RESTART_DELAY=3
-rapid_crash_count=0
-
-cd "$REPO_ROOT"
-
-while true; do
-    echo ""
-    echo "🚀 Starting Telegram Bot..."
-    echo "================================"
-
-    start_time=$(date +%s)
-    "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" &
-    BOT_PID=$!
-    wait $BOT_PID
-    exit_code=$?
-    BOT_PID=""
-    end_time=$(date +%s)
-
-    # Normal exit, no restart
-    if [ $exit_code -eq 0 ]; then
-        echo "✅ Bot exited normally"
-        break
-    fi
-
-    # Log crash details
-    crash_log="$LOGS_DIR/crash_$(date +%Y%m%d_%H%M%S).log"
-    {
-        echo "=== Bot crashed ==="
-        echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "Exit code: $exit_code"
-        echo "Uptime: $((end_time - start_time)) seconds"
-    } > "$crash_log"
-    echo "❌ Bot crashed (exit code: $exit_code), log written to: $crash_log"
-
-    # Rapid crash detection
-    if [ $((end_time - start_time)) -lt $RAPID_CRASH_WINDOW ]; then
-        rapid_crash_count=$((rapid_crash_count + 1))
-        echo "⚠️  Rapid crash ($rapid_crash_count/$MAX_RAPID_CRASHES)"
-        if [ $rapid_crash_count -ge $MAX_RAPID_CRASHES ]; then
-            echo "🛑 Rapid crash limit reached ($MAX_RAPID_CRASHES times), stopping restart"
-            exit 1
-        fi
-    else
-        rapid_crash_count=0
-    fi
-
-    echo "🔄 Auto-restarting in ${RESTART_DELAY} seconds..."
-    sleep $RESTART_DELAY
-done
+prepare_runtime
+exec_bot_once

@@ -131,6 +131,7 @@ class TestConnectionResilience(unittest.TestCase):
 
         self.bot.application = mock_app
         self.bot.build = Mock()
+        self.bot._probe_claude_readiness = Mock(return_value=(True, ""))
 
         with self.assertRaises(SystemExit):
             self.bot.run()
@@ -144,6 +145,7 @@ class TestConnectionResilience(unittest.TestCase):
 
         self.bot.application = mock_app
         self.bot.build = Mock()
+        self.bot._probe_claude_readiness = Mock(return_value=(True, ""))
 
         with self.assertRaises(SystemExit):
             self.bot.run()
@@ -176,6 +178,7 @@ class TestConnectionResilience(unittest.TestCase):
         self.bot.build = Mock()
         self.bot._on_ready = AsyncMock()
         self.bot._wait_for_polling_exit = AsyncMock(side_effect=SystemExit("stop"))
+        self.bot._probe_claude_readiness = Mock(return_value=(True, ""))
 
         with self.assertRaises(SystemExit):
             self.bot.run()
@@ -207,6 +210,7 @@ class TestConnectionResilience(unittest.TestCase):
         mock_app.bot = Mock()
 
         self.bot._on_ready = AsyncMock()
+        self.bot._probe_claude_readiness = Mock(return_value=(True, ""))
 
         build_count = 0
 

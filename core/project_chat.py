@@ -27,6 +27,7 @@ from claude_code_sdk._internal.transport.subprocess_cli import SubprocessCLITran
 
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.utils.config import config
+from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +498,7 @@ class ProjectChatHandler:
 
                     if msg.is_error:
                         logger.error(f"SDK returned error: {content[:500]}")
+                        health_reporter.record_claude_error(content)
                         log_chat(
                             req.user_id,
                             msg.session_id or req.requested_session_id,
@@ -515,6 +517,7 @@ class ProjectChatHandler:
                             ),
                         )
                     else:
+                        health_reporter.record_claude_ok()
                         log_chat(
                             req.user_id,
                             msg.session_id or req.requested_session_id,
@@ -572,6 +575,7 @@ class ProjectChatHandler:
                             f"Streaming finalization on error failed: {finalize_err}"
                         )
                 err = str(e)
+                health_reporter.record_claude_error(err)
                 log_chat(
                     req.user_id, req.requested_session_id, "error", err, success=False
                 )
@@ -670,6 +674,7 @@ class ProjectChatHandler:
             )
             await self.stop(user_id)
             msg = f"⏰ Timed out after {PROCESS_TIMEOUT}s. Please retry or simplify your request."
+            health_reporter.record_claude_error(msg)
             return ChatResponse(content=msg, success=False, error=msg)
 
         except Exception as e:
@@ -745,6 +750,7 @@ class ProjectChatHandler:
                         exc_info=True,
                     )
                     retry_msg = str(retry_err)
+                    health_reporter.record_claude_error(retry_msg)
                     return ChatResponse(
                         content=f"❌ Error: {retry_msg}",
                         success=False,
@@ -752,6 +758,7 @@ class ProjectChatHandler:
                     )
 
             logger.error(f"Error processing message: {e}", exc_info=True)
+            health_reporter.record_claude_error(err)
             return ChatResponse(content=f"❌ Error: {err}", success=False, error=err)
 
         finally:
